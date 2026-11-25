@@ -888,12 +888,13 @@ extern "system" fn copy_buffer_region(
 /// other is not ([`crate::resource::target_format`]): their texels differ
 /// in size, so the host cannot copy between them (logged once).
 #[cfg(windows)]
-fn unlike(dst: This, src: This, from_buffer: bool) -> bool {
+fn unlike(dst: This, src: This, mapped: bool) -> bool {
     // A host copy without its largest levels has other subresources and
-    // sizes than the title's texture (`crate::resource::drop_levels`): a
-    // copy from a buffer into it goes to the level it has
-    // (`crate::resource::host_subresource`), any other is skipped.
-    if crate::resource::dropped(src) > 0 || (!from_buffer && crate::resource::dropped(dst) > 0) {
+    // sizes than the title's texture (`crate::resource::drop_levels`). A
+    // caller that maps subresources (`mapped`) copies level by level to the
+    // levels the host has (`crate::resource::host_subresource`); any other
+    // copy with such a texture is skipped.
+    if !mapped && (crate::resource::dropped(src) > 0 || crate::resource::dropped(dst) > 0) {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             tracing::warn!(?dst, ?src, "copy with a texture whose host copy leaves out levels skipped")
@@ -925,7 +926,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if unlike(dst, src, false) {
+            // Host copies that leave out different numbers of levels differ
+            // in shape: copied level by level below.
+            let levelwise = crate::resource::dropped(dst) != crate::resource::dropped(src);
+            if unlike(dst, src, true) {
                 return;
             }
             // Two title textures over the same memory have one host
@@ -967,8 +971,12 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, src, COPY_SOURCE);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
-            // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(to, from) };
+            if levelwise {
+                copy_levels(list, dst, to, src, from);
+            } else {
+                // SAFETY: an open list and live textures.
+                unsafe { list.list.CopyResource(to, from) };
+            }
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -978,6 +986,42 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
+}
+
+/// A whole-texture copy between host copies that leave out different
+/// numbers of levels (`crate::resource::drop_levels`): each title level both
+/// host copies have, at its own index in each. A title level has the same
+/// size in every host copy that has it.
+#[cfg(windows)]
+fn copy_levels(
+    list: &crate::host::HostList,
+    dst: This,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    src: This,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        ID3D12Resource,
+    };
+    let location = |texture: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
+    };
+    let count = crate::resource::title_subresources(dst).min(crate::resource::title_subresources(src));
+    for index in 0..count {
+        let (Some(d), Some(s)) = (
+            crate::resource::host_subresource(dst, index),
+            crate::resource::host_subresource(src, index),
+        ) else {
+            continue;
+        };
+        // SAFETY: an open list and live textures; both subresources exist
+        // and have the title level's size.
+        unsafe { list.list.CopyTextureRegion(&location(to, d), 0, 0, 0, &location(from, s), None) };
+    }
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
@@ -1053,7 +1097,9 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
-        if unlike(dst.resource, src.resource, src.kind == FOOTPRINT) {
+        // Both locations are mapped to the levels their host copies have
+        // (below), so copies with textures that leave out levels go ahead.
+        if unlike(dst.resource, src.resource, true) {
             return;
         }
         // Into a host copy without its largest levels: the level it has,
@@ -1112,6 +1158,14 @@ extern "system" fn copy_texture_region(
                 && src.kind != FOOTPRINT
                 && dst.kind != FOOTPRINT
                 && src.footprint.offset as u32 == dst.footprint.offset as u32;
+            // From a host copy without its largest levels: the level it
+            // has (the same size as the title's), or nothing.
+            if crate::resource::dropped(src.resource) > 0 {
+                match crate::resource::host_subresource(src.resource, src.footprint.offset as u32) {
+                    Some(index) => from.footprint.offset = u64::from(index),
+                    None => return,
+                }
+            }
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
