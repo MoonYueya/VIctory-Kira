@@ -1675,7 +1675,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.dimension == TEXTURE_2D
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
-            && r.desc.sample_count <= 1;
+            && r.desc.sample_count <= 1
+            // The tile path numbers levels as the title does; a texture
+            // whose host copy leaves out levels stays on the plain path.
+            && drop_levels(&r.desc) == 0;
         if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
