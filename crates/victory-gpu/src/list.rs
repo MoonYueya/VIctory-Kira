@@ -1010,6 +1010,8 @@ fn copy_levels(
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
     };
+    #[cfg(feature = "diagnostics")]
+    crate::resource::LEFT_OUT[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let count = crate::resource::title_subresources(dst).min(crate::resource::title_subresources(src));
     for index in 0..count {
         let (Some(d), Some(s)) = (

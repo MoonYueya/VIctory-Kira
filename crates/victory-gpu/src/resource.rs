@@ -1189,6 +1189,31 @@ pub(crate) struct HostTexture {
 #[cfg(windows)]
 pub(crate) type Holds = std::sync::Mutex<Option<(u32, crate::texture::Digest)>>;
 
+/// What `VICTORY_TEXTURE_DROP_MIPS` did since the start, for the memory
+/// line: host copies that left out levels, the levels they left out, the
+/// bytes of host copy the title's whole texture would have taken, and
+/// copies that went level by level because host copies leave out different
+/// levels (`crate::list` `copy_levels`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static LEFT_OUT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// One host copy made with levels left out: how many, and the bytes of the
+/// host copy the title's whole texture would have taken ([`LEFT_OUT`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn left_out(levels: u32, whole_bytes: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    LEFT_OUT[0].fetch_add(1, Relaxed);
+    LEFT_OUT[1].fetch_add(u64::from(levels), Relaxed);
+    LEFT_OUT[2].fetch_add(whole_bytes, Relaxed);
+}
+
+/// [`LEFT_OUT`], as the memory line prints it.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn left_out_counts() -> [u64; 5] {
+    use std::sync::atomic::Ordering::Relaxed;
+    std::array::from_fn(|i| LEFT_OUT[i].load(Relaxed))
+}
+
 /// [`HostTexture::serial`] of the last one made.
 #[cfg(windows)]
 static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1549,6 +1574,11 @@ pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
 /// is not set (the default: host copies keep every level and the branch
 /// below returns at its first test, so nothing else changes).
 #[cfg(windows)]
+pub(crate) fn drop_switch() -> u32 {
+    switch()
+}
+
+#[cfg(windows)]
 fn switch() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -1757,6 +1787,14 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         };
         host.base = base;
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
+        // The levels this host copy leaves out, for the memory line
+        // (VICTORY_TEXTURE_DROP_MIPS, off unless set).
+        #[cfg(feature = "diagnostics")]
+        if let Some(drop) = std::num::NonZeroU32::new(drop_levels(&r.desc)) {
+            let whole = texture_layout(&r.desc.from_level(base)).map_or(0, |t| t.size);
+            left_out(drop.get(), whole);
+        }
+
         if base > 0 {
             HELD[0].fetch_add(1, Relaxed);
             HELD[1].fetch_add(host.bytes, Relaxed);

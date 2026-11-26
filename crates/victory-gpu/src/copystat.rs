@@ -841,6 +841,19 @@ fn log_memory() {
             mb(again_mb),
         );
     }
+    // `VICTORY_TEXTURE_DROP_MIPS=N`: what leaving levels out did. Printed
+    // only with the switch, so a run without it has the lines it had.
+    if crate::resource::drop_switch() > 0 {
+        let [copies, levels, whole, _, levelwise] = crate::resource::left_out_counts();
+        tracing::info!(
+            "levels left out of host copies (VICTORY_TEXTURE_DROP_MIPS={}): {} host copies, {} levels, {:.0} MB of the card's memory they would have taken whole; {} copies between textures went level by level; shaders see each one a level smaller per level left out",
+            crate::resource::drop_switch(),
+            copies,
+            levels,
+            mb(whole),
+            levelwise,
+        );
+    }
     let targets = crate::resource::targets_census();
     tracing::info!(
         "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
