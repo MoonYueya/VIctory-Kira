@@ -9379,6 +9379,143 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+/// Turns the budget line on: VICTORY_BUDGET_LOG=1. Off unless asked for, and
+/// once a process.
+fn budget_log_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| budget_on(std::env::var("VICTORY_BUDGET_LOG").ok().as_deref()))
+}
+
+/// [`budget_log_on`] for the value of `VICTORY_BUDGET_LOG`, which turns the line
+/// on for `1` and for nothing else (`0`, or a word, leaves it off).
+fn budget_on(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+/// What to reserve of the card's own memory, in bytes: VICTORY_BUDGET_RESERVE_MB
+/// (0: none, the default), or -1 for all the system says is available
+/// (DXGI_QUERY_VIDEO_MEMORY_INFO::AvailableForReservation). An A/B switch for
+/// whether a reservation steadies the budget, asked of this process only.
+fn budget_reserve_wanted() -> Option<i64> {
+    static WANTED: OnceLock<Option<i64>> = OnceLock::new();
+    *WANTED.get_or_init(|| {
+        let mb = std::env::var("VICTORY_BUDGET_RESERVE_MB").ok()?;
+        mb.trim().parse::<i64>().ok()
+    })
+}
+
+/// [`budget_reserve_wanted`] in bytes: a size in MB as asked (`0`: no
+/// reservation), a negative one (the `-1` of `--reserve all`) as all `available`
+/// is, and `None` when nothing was asked for.
+fn reserve_bytes(wanted: Option<i64>, available: u64) -> Option<u64> {
+    match wanted? {
+        mb if mb >= 0 => Some((mb as u64) << 20),
+        _ => Some(available),
+    }
+}
+
+/// The process's memory and the PC's, in bytes: working set, private bytes,
+/// physical memory free, and what is left to commit.
+fn budget_process_memory() -> (u64, u64, u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    unsafe { GlobalMemoryStatusEx(&mut m) };
+    (c.WorkingSetSize as u64, c.PagefileUsage as u64, m.ullAvailPhys, m.ullAvailPageFile)
+}
+
+/// Once a second while VICTORY_BUDGET_LOG=1, and at once whenever the card's
+/// budget, its use, or the use of the PC's memory shared with the card moved by
+/// 16 MB or more: both memory groups as the system counts them (budget, use,
+/// what could still be reserved, what is reserved), the process's own memory,
+/// the free physical memory, the frame, and the milliseconds since the start.
+///
+/// With VICTORY_BUDGET_RESERVE_MB set, the reservation asked for is put in place
+/// here too, and what the system made of it is in the same line.
+fn budget_watch(adapter: &IDXGIAdapter3) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let wanted = budget_reserve_wanted();
+    if !budget_log_on() && wanted.is_none() {
+        return;
+    }
+    let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    let mut shared = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    // SAFETY: plain queries that fill our structures.
+    unsafe {
+        if adapter
+            .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own)
+            .is_err()
+            || adapter
+                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
+                .is_err()
+        {
+            return;
+        }
+    }
+    static LAST: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let now = [own.Budget, own.CurrentUsage, shared.CurrentUsage, shared.Budget];
+    let last = [0, 1, 2, 3].map(|i| LAST[i].swap(now[i], Relaxed));
+    let ms = now_ms();
+    let moved = (0..4).any(|i| last[i] != 0 && last[i].abs_diff(now[i]) >= (16u64 << 20));
+    let said = SAID.load(Relaxed);
+    if !moved && said != u64::MAX && ms < said + 1000 {
+        return;
+    }
+    SAID.store(ms, Relaxed);
+    // The reservation, asked for once (and again if the system gives it back).
+    let mut reserve_note = "";
+    let want = reserve_bytes(wanted, own.AvailableForReservation);
+    if let Some(want) = want {
+        if !ASKED.load(Relaxed) || (want != 0 && own.CurrentReservation == 0) {
+            // SAFETY: a plain call on the adapter this device is on.
+            let set = unsafe { adapter.SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, want) };
+            ASKED.store(true, Relaxed);
+            reserve_note = if set.is_ok() {
+                " (the reservation was asked for)"
+            } else {
+                " (the reservation was refused)"
+            };
+            // SAFETY: plain queries that fill our structures.
+            unsafe {
+                let _ = adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own);
+            }
+        }
+    }
+    if !budget_log_on() {
+        return;
+    }
+    let (working, private, free, _) = budget_process_memory();
+    tracing::info!(
+        "budget: the card's own: budget {} MB, in use {} MB, {} MB could still be reserved, {} MB reserved; the PC's shared with the card: budget {} MB, in use {} MB, {} MB could still be reserved, {} MB reserved; the process {} MB in memory ({} MB private), {} MB of the PC's memory free; frame {}, {} ms in{}",
+        own.Budget >> 20,
+        own.CurrentUsage >> 20,
+        own.AvailableForReservation >> 20,
+        own.CurrentReservation >> 20,
+        shared.Budget >> 20,
+        shared.CurrentUsage >> 20,
+        shared.AvailableForReservation >> 20,
+        shared.CurrentReservation >> 20,
+        working >> 20,
+        private >> 20,
+        free >> 20,
+        crate::frame::current(),
+        ms,
+        reserve_note
+    );
+}
+
 impl Host {
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
@@ -9397,12 +9534,13 @@ impl Host {
                 .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
                 .ok()?;
         }
+        budget_watch(&adapter);
         // The card's budget moved by 256 MB or more since the last look:
         // said at once, with what was in use at the last look, so the log
         // has the moment. (It fell from 11,242 MB to some 10,300 MB with
         // the first world frame in runs 179 to 185, and the memory line,
-        // seconds later, was the first to show it. We reserve nothing
-        // and make the swap chain once, at the start.)
+        // seconds later, was the first to show it. Nothing is reserved
+        // unless VICTORY_BUDGET_RESERVE_MB says to: see budget_watch.)
         static LAST: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
         let now = [own.Budget, own.CurrentUsage, shared.CurrentUsage];
         let last = [0, 1, 2].map(|i| LAST[i].swap(now[i], Ordering::Relaxed));
@@ -10735,6 +10873,28 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn the_budget_line_is_off_unless_asked_for_with_a_one() {
+        assert!(!super::budget_on(None));
+        assert!(super::budget_on(Some("1")));
+        assert!(super::budget_on(Some(" 1 ")));
+        assert!(!super::budget_on(Some("0")));
+        assert!(!super::budget_on(Some("")));
+        assert!(!super::budget_on(Some("yes")));
+        assert!(!super::budget_on(Some("true")));
+    }
+
+    #[test]
+    fn a_reservation_is_a_size_or_all_the_system_offers() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(super::reserve_bytes(None, 7 * gib), None);
+        assert_eq!(super::reserve_bytes(Some(0), 7 * gib), Some(0));
+        assert_eq!(super::reserve_bytes(Some(2048), 7 * gib), Some(2048 << 20));
+        assert_eq!(super::reserve_bytes(Some(-1), 7 * gib), Some(7 * gib));
+        // Anything below zero is "all of it", not a size.
+        assert_eq!(super::reserve_bytes(Some(-4096), 3 * gib), Some(3 * gib));
     }
 }
 

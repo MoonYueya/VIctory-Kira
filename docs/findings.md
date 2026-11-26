@@ -428,3 +428,55 @@ no sweep line, and the live window copies were under the cap. Its band only acts
 system RAM is under pressure, and this host had 22 GB free, so the run is a
 control-equivalent, not a measurement of the cap.
 
+### The DXGI budget under an RTX 3080: what it follows, and what does not bring it back, 2026-11-26
+
+The system's budget for the card's own memory is not a fixed line and not a
+function of what this process submits. Three 480 s runs of the diagnostics build
+(`9beb553`), the same switches and the same warm cache, logging both memory groups
+every second and at every 16 MB move (`VICTORY_BUDGET_LOG=1`, off by default):
+
+| | run `budget-ctl` | run `budget-ctl2` | run `budget-reserve` |
+|---|---|---|---|
+| local budget | 7,215-9,283 MB, 157 values | 7,305-9,283 MB, 249 values | 6,590-9,283 MB, 264 values |
+| largest single fall | -1,853 MB at frame 1101 | -1,785 MB at frame 1381 | same order |
+| local use, peak | 8,743 MB | 9,521 MB | 8,838 MB |
+| samples over budget | 78 % | 86 % | 91 % |
+| non-local use, peak | 8,209 MB | 8,637 MB | 7,481 MB |
+| process private, peak | 27,980 MB | 28,681 MB | 26,667 MB |
+| free physical, least | 108 MB | 33 MB | 305 MB |
+| `CurrentReservation` | 0 | 0 | **4,769 MB** |
+
+**What the budget follows.** Over 600 and 881 paired samples the local budget
+correlates with the process's working set at -0.91 and -0.79, with its private
+bytes at -0.80 and -0.88, with the use of the PC's memory shared with the card at
+-0.82 and -0.88, and with free physical memory at +0.89 and +0.78. The largest
+fall of each run is at the first world frame, where the process goes from 6 GB to
+17 GB private; the hundred falls after it happen while free physical memory sits
+in the hundreds of MB and neither the card's use nor any other process's moved.
+This is the semantics the documents give: `Budget` is what the OS assigns the
+process under whole-system pressure, not a grant that follows the process's own
+requests.
+
+**A reservation does not hold it.** `SetVideoMemoryReservation` is called nowhere
+in this tree, in Marvisak/VIctory (`63bcca4`), in avatarmanz/VIctory-7900XTX
+(`74f9cf1`) or in fxceless/victory-gta6 (`461c55b`) — nor is
+`RegisterVideoMemoryBudgetChangeNotificationEvent`; every one of them polls
+`QueryVideoMemoryInfo`. With `VICTORY_BUDGET_RESERVE_MB=-1` the reserved amount
+shows as 4,769 MB for the whole run, `AvailableForReservation` stays at 4,769 MB
+throughout (so what the system *could* give never changes), and the budget still
+falls to 6,590 MB — lower than either run without a reservation — with 91 % of
+samples over it. The document's own wording is that a reservation tells the OS
+what the application "cannot go without", to "quickly minimize the impact of large
+memory pressure situations": it decides who is trimmed first, not what the budget is.
+
+**Who else holds the card.** From the performance counters
+(`GPU Process Memory(*)\Dedicated Usage`, 5 s) the card is at 2,291 MiB idle and
+9,599-9,699 MiB in a run. Of that, this process takes 7.4-7.9 GB; the desktop
+compositor (dwm) 1.3-1.8 GB; the input method 408 MB; QQ 275-285 MB; an Edge
+WebView 188 MB; iCloud 184-187 MB; the harness itself 144-261 MB. Apart from dwm's
++250-450 MB when the window appears, none of them moves during a run.
+
+**What this leaves.** Nothing in the layer's own switches brings the budget back;
+what it can do is stay under a budget it does not control, and the largest term it
+controls is the 7.3-8.6 GB it puts in the PC's shared memory beside the 28 GB it
+holds privately.
