@@ -547,7 +547,41 @@ first.
 Fixed by this work: the ledger itself. Not settled: whether lowering the empty-block reserve
 gives the textures the room back without making the pool re-create blocks, and what the
 buffer copies cost in frame time when they are not on the card.
-\n## RTX 3080: lowering the empty-block reserve frees nothing, because the blocks are not empty\n\nThe block pool was the largest single item the VRAM ledger named on this card, and about\n1.5 GB of it looked empty. It is not a reserve that can be given back: it is holes inside\nblocks that are still in use.\n\n- **The two  constants are different things.**  counts empty 64 MiB\n  heaps of texture memory (64 of them, 4 GiB);  counts bytes of upload scratch\n  chunks (1 GiB of the PC's memory). Separate pools, separate units, no shared meaning.\n- ** caps the first of them, and unset it changes nothing.** It lowers\n  whichever of the two the card's room picked and never raises it; the blocks made ahead\n  follow the same cap, so a low cap cannot turn into make-and-drop churn. Two runs, one\n  switch apart, the same diag build and cache, 480 s of world each:\n\n| | control |  |\n|---|---|---|\n| card in use / budget | 8,668 / 7,532 MB | 8,938 / 7,711 MB |\n| blocks, whole | 2,624 MB / 41 | 2,752 MB / 43 |\n| bytes of blocks no piece holds | 1,006 MB | 1,114 MB |\n| blocks with nothing in them at all | 2 | 2 |\n| blocks made in all, let go | 41 / 2 | 43 / 0 |\n| passes that made none for lack of room | 409 | 334 |\n| world frame, median | 546.6 ms | 552.5 ms |\n\n- **The 1 GB was never reclaimable.** A run made 41 blocks and let go of 2; the rest stayed\n  held by textures the whole time. The ledger's "empty and kept" is block bytes no piece\n  covers, and  only lets go of a block whose free ranges are the whole block.\n  Holes inside a block are invisible to it, so a cap of 2 changed nothing: the wholly empty\n  blocks were 2 all along, and the pool let go of none.\n- **So the reserve is not where the room is.** Lowering it does not give the textures\n  anything back, and no default was changed for it. What the numbers point at instead is\n  fragmentation: 1 GB of holes across 41 blocks, which wants blocks of more than one size,\n  not a smaller reserve.\n
+
+## RTX 3080: lowering the empty-block reserve frees nothing, because the blocks are not empty
+
+The block pool was the largest single item the VRAM ledger named on this card, and about
+1.5 GB of it looked empty. It is not a reserve that can be given back: it is holes inside
+blocks that are still in use.
+
+- **The two `SPARE_KEPT` constants are different things.** `SPARE_KEPT` in `pool.rs` counts empty 64 MiB
+  heaps of texture memory (64 of them, 4 GiB); `SPARE_KEPT` in `host.rs` counts bytes of upload scratch
+  chunks (1 GiB of the PC's memory). Separate pools, separate units, no shared meaning.
+- **`VICTORY_POOL_SPARE` caps the first of them, and unset it changes nothing.** It lowers
+  whichever of the two the card's room picked and never raises it; the blocks made ahead
+  follow the same cap, so a low cap cannot turn into make-and-drop churn. Two runs, one
+  switch apart, the same diag build and cache, 480 s of world each:
+
+| | control | `VICTORY_POOL_SPARE=2` |
+|---|---|---|
+| card in use / budget | 8,668 / 7,532 MB | 8,938 / 7,711 MB |
+| blocks, whole | 2,624 MB / 41 | 2,752 MB / 43 |
+| bytes of blocks no piece holds | 1,006 MB | 1,114 MB |
+| blocks with nothing in them at all | 2 | 2 |
+| blocks made in all, let go | 41 / 2 | 43 / 0 |
+| passes that made none for lack of room | 409 | 334 |
+| world frame, median | 546.6 ms | 552.5 ms |
+
+- **The 1 GB was never reclaimable.** A run made 41 blocks and let go of 2; the rest stayed
+  held by textures the whole time. The ledger's "empty and kept" is block bytes no piece
+  covers, and `rested()` only lets go of a block whose free ranges are the whole block.
+  Holes inside a block are invisible to it, so a cap of 2 changed nothing: the wholly empty
+  blocks were 2 all along, and the pool let go of none.
+- **So the reserve is not where the room is.** Lowering it does not give the textures
+  anything back, and no default was changed for it. What the numbers point at instead is
+  fragmentation: 1 GB of holes across 41 blocks, which wants blocks of more than one size,
+  not a smaller reserve.
+
 
 
 ## The console profile: what Series S costs and saves, RTX 3080 (two runs)

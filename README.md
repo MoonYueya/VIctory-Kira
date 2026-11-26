@@ -14,17 +14,19 @@ publisher.
 ## Where it stands (2026-11-26)
 
 Tested on one machine only: Windows 11, Ryzen 7 7700, 31 GB RAM, **RTX 3080 10 GB**
-(driver 32.0.16.1742), the Series X profile, `scripts\play.ps1` defaults. Each line
-below is from single runs of 360-480 s in the world, not long sessions.
+(driver 32.0.16.1742), the Series X profile, `scripts\play.ps1` defaults. Each line is from
+single runs of 360-600 s in the world, not long sessions; the frame-time range spans several
+switch sets and scenes, and the Series S line is one A/B pair at `9102a4c` (per-run numbers
+are in [docs/findings.md](docs/findings.md)).
 
 | | |
 |---|---|
 | Into the world, unattended | yes, every run so far; no device removal |
 | World frame time, median | 320-550 ms a frame (about 2-3 fps), depending on the scene |
-| Where a frame goes | GPU work ~85 ms, GPU idle ~140 ms, CPU preparing ~45-65 ms; the rest is copies and waits |
+| Where a frame goes | GPU work ~85 ms, GPU idle ~140 ms, CPU preparing ~43 ms (median); the rest is copies and waits |
 | Card memory | ~8.9 GB in use against a DXGI budget of ~7.6 GB, which falls further when system RAM is tight |
 | System memory | 27-29 GB private: **a 32 GB machine is at its limit**; free physical memory drops to tens of MB |
-| Series S profile (`-SeriesS`) | card memory -27 %, private memory -4.4 GB, rendered at 1080p instead of 4K, no faster |
+| Series S profile (`-SeriesS`) | card memory -27 %, private memory -4.4 GB, renders at 1080p instead of 4K (one A/B pair), not faster; not a default |
 
 What is known to be wrong here:
 
@@ -32,8 +34,8 @@ What is known to be wrong here:
   its budget, so new textures are passed over for lack of room.
 - The frame rate is far from playable; the bottleneck is on the CPU side
   (submission, copies, synchronisation), not GPU arithmetic.
-- The first run with a new build or driver is dark and stutters until the pipeline
-  cache is warm (`victory warm --used`).
+- The first run with a new build or driver stutters while the driver makes pipelines
+  (`victory warm --used` makes them ahead for later runs).
 
 ## How to run it
 
@@ -47,19 +49,22 @@ cd VIctory-Kira
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
 target\diag\victory.exe shaders <the shader archives>   # once, translates every shader
-target\diag\victory.exe warm --used                     # for a new build or driver
+scripts\play.ps1 -Exe <path of your copy's executable>  # first run; the caches fill as it goes
+target\diag\victory.exe warm --used                     # after a run, and after a build or driver change
 scripts\play.ps1 -Exe <path of your copy's executable>
 ```
 
-Use the `diag` build: the plain default build has frame capture and scripted keys
-compiled out, and a run of it never leaves the menu. On an NVIDIA card (vendor
+`warm --used` makes the host pipelines earlier runs drew with: it reads the list a run
+writes, so on a fresh clone it warms nothing, and it is the second and later runs that
+benefit. Use the `diag` build throughout: the plain default build has frame capture and
+scripted keys compiled out, and a run of it never leaves the menu. On an NVIDIA card (vendor
 `0x10DE`) `play.ps1` sets `VICTORY_TEXTURE_ROOM_PERCENT=97` (AMD keeps its 90).
 `-Safe` leaves the newer, faster ways out; `-SeriesS` plays the Series S profile.
 Closing heavy background programs before a run gives the card's budget back some room.
 
-[tools/kira-harness](tools/kira-harness) runs the title unattended (scripted keys,
-a save template, a run lock, frame capture, a results file) and turns a run log into
-a baseline table; see its README.
+`tools/kira-harness` runs the title unattended (scripted keys, a save template, a run
+lock, frame capture, a results file) and turns a run log into a baseline table; see
+[its README](tools/kira-harness/README.md).
 
 ## What is different from upstream
 
@@ -70,7 +75,7 @@ in the history:
 |---|---|---|
 | [#47](https://github.com/avatarmanz/VIctory-7900XTX/pull/47) | gomeaw | Dynamic descriptor tables from coalesced free ranges |
 | [#48](https://github.com/avatarmanz/VIctory-7900XTX/pull/48) | gomeaw | Dynamic descriptor ranges reclaimed at GPU completion |
-| [#24](https://github.com/avatarmanz/VIctory-7900XTX/pull/24) | gomeaw | Unrelated buffer slots skipped in each spread heap scan |
+| [#24](https://github.com/avatarmanz/VIctory-7900XTX/pull/24) | UwUCammie | Unrelated buffer slots skipped in each spread heap scan |
 | [#23](https://github.com/avatarmanz/VIctory-7900XTX/pull/23) | gomeaw | Structured buffer reads stay raw on heaps without descriptor twins |
 | [#78](https://github.com/avatarmanz/VIctory-7900XTX/pull/78) | feanorsun | `play.ps1` fails on a missing executable |
 | [#42](https://github.com/avatarmanz/VIctory-7900XTX/pull/42) | gomeaw | Render and depth descriptor scratch private to each recording thread |
@@ -80,8 +85,8 @@ in the history:
 | [#4](https://github.com/avatarmanz/VIctory-7900XTX/pull/4) | gomeaw | LDS flag regions run on 32-lane GPUs |
 | [#58](https://github.com/avatarmanz/VIctory-7900XTX/pull/58) | battledogegames-design | Direct-heap root-signature flags from shader features |
 | [#17](https://github.com/avatarmanz/VIctory-7900XTX/pull/17) | UwUCammie | A frame is counted after DXGI accepts the present |
-| [#69](https://github.com/avatarmanz/VIctory-7900XTX/pull/69) | Adika713 | Memory category log (`VICTORY_MEMORY_CATEGORIES=1`, off by default), ported as `28f166b` |
-| [#77](https://github.com/avatarmanz/VIctory-7900XTX/pull/77) | Adika713 | Idle window budget (`VICTORY_WINDOW_BUDGET_MB`, off by default; on this card it keeps copies rather than capping them, see findings) |
+| [#69](https://github.com/avatarmanz/VIctory-7900XTX/pull/69) | Adika713 | Memory category log (`VICTORY_MEMORY_CATEGORIES=1`, off by default), re-applied here as `28f166b` |
+| [#77](https://github.com/avatarmanz/VIctory-7900XTX/pull/77) | Adika713 | Idle window budget (`VICTORY_WINDOW_BUDGET_MB`, off by default), re-applied here and merged as `8287508`; on this card it keeps copies rather than capping them, see findings |
 
 Changes of this branch:
 
@@ -97,15 +102,19 @@ Changes of this branch:
     and a reservation test.
   - `VICTORY_POOL_SPARE`: how many empty texture blocks are kept.
   - `VICTORY_DROP_HOST_COPY=1`: let a texture's host copy go once its upload ran.
+  - `VICTORY_WINDOW_BUDGET_MB`: how much of the title's window copies to keep under system
+    memory pressure (#77; it behaves as a floor, see findings).
   - `-SeriesS` in `play.ps1`.
 
 Measured on the RTX 3080 and **not** taken, with the numbers, in
 [docs/findings.md](docs/findings.md): upstream PR #72 (VRAM eviction, frame time
-×4 here), the Marvisak eviction water marks (branch `experiment/evict`), a DXGI
-memory reservation, a smaller empty-block cap, and a window budget that is always on
-(branch `experiment/winbudget`).
+×4 here), the Marvisak eviction water marks (`VICTORY_EVICT`, branch `experiment/evict`),
+a DXGI memory reservation (`VICTORY_BUDGET_RESERVE_MB`), a lower empty-block cap
+(`VICTORY_POOL_SPARE`, which is in the tree but changes nothing here), and a window budget
+that is always on (`VICTORY_WINDOW_BUDGET_ALWAYS`, branch `experiment/winbudget`).
 
-Tests on this branch: **953 passed, 0 failed, 45 ignored** (`cargo test --workspace`).
+Tests on this branch: **953 passed, 0 failed, 45 ignored** (`cargo test --workspace` at
+`3b7be2b`; the commits after it change documentation only).
 
 ## What is next
 
@@ -124,7 +133,8 @@ These changes were made with AI assistance. GPL-3.0-or-later, as upstream.
 
 ---
 
-*The rest of this file is upstream's README (avatarmanz/VIctory-7900XTX), unchanged.*
+*The rest of this file is the README of the repository this one forks
+(avatarmanz/VIctory-7900XTX), unchanged.*
 
 # VIctory on an RX 7900 XTX
 
