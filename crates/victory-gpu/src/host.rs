@@ -8238,6 +8238,7 @@ impl Batch {
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
+        let mut planning = crate::timeline::span("refreshes in front: the steps gathered");
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
         let mut due = Vec::new();
         let mut touches = Vec::new();
@@ -8266,10 +8267,12 @@ impl Batch {
                 }
             }
         }
+        planning.next("refreshes in front: the spans");
         let spans: Vec<_> = front_spans(touches.into_iter())
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
             .collect();
+        planning.end();
         self.front = true;
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
@@ -8286,8 +8289,10 @@ impl Batch {
         // many: then beside the others.
         const FEW: usize = 256;
         let mut spans = spans;
-        let many = spans.len() > FEW;
+        // (Renderer port #6: on the threads beside, whatever their number.)
+        let many = spans.len() > FEW || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
         if !many {
+            let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
@@ -8444,7 +8449,9 @@ impl Batch {
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
         let light = crate::watch::light();
-        if light && self.refreshes.len() <= FEW {
+        // Renderer port #6: looked at on the threads beside, below.
+        let beside = light && crate::watch::port_guard_plan() && wide_refresh() && self.refreshes.len() >= 4;
+        if light && self.refreshes.len() <= FEW && !beside {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
@@ -8479,10 +8486,12 @@ impl Batch {
             // watch mode: the light one dropped the copies that changed
             // nothing here first, the heavy one cannot (nothing_new is only
             // meaningful when view memory is tracked).
+            // (Renderer port #6: with `beside`, looked at on the threads
+            // beside even when they are few.)
             let refreshes = std::mem::take(&mut self.refreshes);
             crate::shadow::wide_each(refreshes.len(), move |i| {
                 let (shadow, from, to) = &refreshes[i];
-                if light && refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
+                if light && (refreshes.len() > FEW || beside) && shadow.nothing_new(*from, *to - *from) {
                     #[cfg(feature = "diagnostics")]
                     FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                     return;
