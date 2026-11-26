@@ -825,6 +825,22 @@ fn log_memory() {
         let [textures, staging] = pool;
         tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
     }
+    // `VICTORY_DROP_HOST_COPY=1`: what was let go as soon as its upload had
+    // run, and what came back. Printed only with the switch, so that a run
+    // without it has the lines it always had.
+    if crate::resource::drop_after_upload() {
+        let [gone, gone_mb, staged_mb, again, again_mb] = crate::resource::dropped();
+        tracing::info!(
+            "host copies let go once their upload had run (VICTORY_DROP_HOST_COPY=1): {} let go since the start, {:.0} MB \
+             of the card's memory (their staging buffers were {:.0} MB of it); {} of those made and uploaded again ({:.0} MB), \
+             each read again from title memory as many bytes as its staging buffer",
+            gone,
+            mb(gone_mb),
+            mb(staged_mb),
+            again,
+            mb(again_mb),
+        );
+    }
     let targets = crate::resource::targets_census();
     tracing::info!(
         "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",

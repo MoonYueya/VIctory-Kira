@@ -1374,6 +1374,37 @@ pub(crate) fn want_level(this: This, first: u32) {
 pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
+/// Whether a host copy is let go as soon as the upload that filled it has
+/// run, rather than when nothing has used it for seconds and the card is
+/// full (`VICTORY_DROP_HOST_COPY=1`; off by default, which is the rule
+/// [`let_go_idle`] has always followed).
+///
+/// What is let go is what [`let_go_idle`] lets go: the same textures
+/// (ones the title fills that the host never copied into), the same guards
+/// (no list, no slot, one reference), and the staging buffer that goes with
+/// it. The next use makes both anew and uploads the title's memory again,
+/// which is what makes this a trade: system memory and the card's memory
+/// against the bytes read and uploaded again.
+#[cfg(windows)]
+pub(crate) fn drop_after_upload() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_DROP_HOST_COPY"))
+}
+
+/// Since the start, of the copies let go because their upload had run
+/// ([`drop_after_upload`]): how many, their bytes, how many of those were
+/// made and uploaded again, their bytes, and the bytes of title memory read
+/// again to fill them (a staging buffer as many bytes as the copy it feeds).
+#[cfg(windows)]
+pub(crate) static DROP: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// How long a copy let go once its upload has run must have been idle: not
+/// at all. What protects it is what protects every copy [`let_go_idle`]
+/// takes: its frames, its reference and the lists and slots that hold it, so
+/// a texture the title sampled twice in a frame is not made twice.
+#[cfg(windows)]
+const DROP_IDLE_MS: u64 = 0;
+
 /// Every title texture alive (not buffers), by address: for the sweep and
 /// the memory line. A texture leaves the table before it is freed.
 #[cfg(windows)]
@@ -1625,6 +1656,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if r.host.gone.load(Relaxed) {
             KINDS[4].fetch_add(1, Relaxed);
             KINDS[5].fetch_add(host.bytes, Relaxed);
+            if drop_after_upload() {
+                DROP[3].fetch_add(1, Relaxed);
+                DROP[4].fetch_add(host.bytes, Relaxed);
+            }
         }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
@@ -2035,14 +2070,22 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
-    let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept();
-            crate::host::vram_keep(budget, used)
+    // With the switch, a copy nothing names goes at once, whatever the card's
+    // memory says: the upload that filled it has run, its bytes are read
+    // again from title memory when it is next used, and every other guard
+    // below is the same.
+    let (idle_ms, most) = if drop_after_upload() {
+        (DROP_IDLE_MS, u64::MAX)
+    } else {
+        match memory {
+            Some([budget, used, ..]) if keep => {
+                let used = used.saturating_sub(crate::pool::texture_room())
+                    + crate::shadow::card_room_kept()
+                    + targets_room_kept();
+                crate::host::vram_keep(budget, used)
+            }
+            _ => (crate::host::vram_idle_ms(memory), u64::MAX),
         }
-        _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
@@ -2094,33 +2137,12 @@ pub(crate) fn let_go_idle() {
         if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
             continue;
         }
-        let gone = {
-            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
-            });
-            if idle {
-                // Under the lock: the next use must not find the staging
-                // state of the texture let go (it says "uploaded").
-                crate::texture::unstage(at as This);
-                r.host.wanted.store(u32::MAX, Relaxed);
-                made.take()
-            } else {
-                None
-            }
-        };
-        if let Some((host, _)) = gone {
-            r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
+        if let Some(gone) = let_go_one(at, r, idle_ms, IDLE_FRAMES) {
             went += 1;
-            bytes += host.bytes;
+            bytes += gone;
             if first.is_none() {
                 first = Some(at);
             }
-            crate::host::retire(host);
         }
     }
     SWEPT_US[0].fetch_add(1, Relaxed);
@@ -2135,6 +2157,60 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Lets go of the host copy of title texture `at` if nothing holds it but
+/// the texture itself and its upload has run ([`let_go_idle`]); the bytes of
+/// the copy that went, or `None`. Its staging buffer goes with it: the next
+/// use makes both anew ([`crate::texture::unstage`]).
+///
+/// The guards are [`let_go_idle`]'s, and they are what makes the copy safe
+/// to make again: the title fills the texture ([`fills`]: no target, depth
+/// or unordered access flag), the host never copied into it
+/// ([`crate::texture::host_wrote`]: then the copy is the only place its
+/// contents exist), and no list, no slot and no other holder names the copy
+/// (`Arc::strong_count` of one, one reference on the host texture).
+#[cfg(windows)]
+fn let_go_one(at: usize, r: &Resource, idle_ms: u64, idle_frames: u64) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    let idle = made.as_ref().is_some_and(|(host, _)| {
+        crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
+            && std::sync::Arc::strong_count(host) == 1
+            && crate::host::references(&host.texture) == 1
+    });
+    if !idle {
+        return None;
+    }
+    // Under this lock, as `crate::texture::staging` asks the host side before
+    // it takes the staging table's: the two are never taken the other way
+    // round.
+    let staging_bytes = crate::texture::staged_bytes(at as This);
+    // Under the lock: the next use must not find the staging state of the
+    // texture let go (it says "uploaded").
+    crate::texture::unstage(at as This);
+    r.host.wanted.store(u32::MAX, Relaxed);
+    let (host, _) = made.take()?;
+    road_counters(host.bytes, staging_bytes);
+    let bytes = host.bytes;
+    r.host.gone.store(true, Relaxed);
+    KINDS[2].fetch_add(1, Relaxed);
+    KINDS[3].fetch_add(bytes, Relaxed);
+    crate::host::retire(host);
+    Some(bytes)
+}
+
+/// What [`let_go_one`] adds to the counters: every copy let go is one of
+/// [`KINDS`]' and, with the switch on, one of [`DROP`]'s.
+#[cfg(windows)]
+fn road_counters(bytes: u64, staging_bytes: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !drop_after_upload() {
+        return;
+    }
+    DROP[0].fetch_add(1, Relaxed);
+    DROP[1].fetch_add(bytes, Relaxed);
+    DROP[2].fetch_add(staging_bytes, Relaxed);
 }
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
@@ -2339,6 +2415,16 @@ impl Drop for HostTexture {
             KINDS[1].fetch_sub(self.bytes, Relaxed);
         }
     }
+}
+
+/// The host copies a texture's drop let go since the last line, for the
+/// memory line: how many, their bytes, how many were made again, their
+/// bytes, and the bytes of title memory read again to fill them
+/// ([`DROP`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn dropped() -> [u64; 5] {
+    use std::sync::atomic::Ordering::Relaxed;
+    std::array::from_fn(|i| DROP[i].load(Relaxed))
 }
 
 /// How many textures placed in title memory have a resource of ours
@@ -4569,5 +4655,115 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// What the switch may let go is exactly what the title can give back:
+    /// a texture the title fills that the host never copied into. Every
+    /// other texture keeps its host copy, because its contents exist on the
+    /// host alone.
+    #[test]
+    fn drop_spares_what_the_title_cannot_give_back() {
+        const TARGET: u32 = 1;
+        const DEPTH: u32 = 2;
+        const UNORDERED: u32 = 4;
+        const DENY_SHADER_RESOURCE: u32 = 8;
+        // A texture the title fills: its contents are in title memory.
+        assert!(fills(&texture(256, 256, 28, 1)));
+        // Render targets, depth targets and unordered access: the host
+        // writes them, so title memory is not what they hold.
+        for flags in [TARGET, DEPTH, UNORDERED, TARGET | DEPTH, DEPTH | UNORDERED, TARGET | UNORDERED, 7] {
+            let desc = ResourceDesc { flags, ..texture(256, 256, 28, 1) };
+            assert!(!fills(&desc), "flags {flags:#x} must not be rebuildable");
+        }
+        // The flag that only says shaders may not read it does not matter.
+        let desc = ResourceDesc { flags: DENY_SHADER_RESOURCE, ..texture(256, 256, 28, 1) };
+        assert!(fills(&desc));
+        // Buffers are not textures and have no copy of this kind.
+        assert!(!fills(&buffer(1024)));
+    }
+
+    /// A texture the host copied into ([`crate::texture::host_written`])
+    /// keeps its host copy even with the switch on: title memory never got
+    /// those texels, so the copy cannot be made again from it.
+    #[test]
+    fn drop_spares_a_texture_the_host_copied_into() {
+        let texture = drop_texture(3, 28, 0);
+        assert!(fills(&resource(texture).desc), "a texture the title fills");
+        assert!(!crate::texture::host_wrote(texture as usize));
+        // The host copied into it: what it shows exists on the host alone.
+        crate::texture::host_written(texture);
+        assert!(crate::texture::host_wrote(texture as usize));
+        // And a texture the title releases leaves the table.
+        crate::texture::forget(texture as usize);
+        assert!(!crate::texture::host_wrote(texture as usize));
+        // SAFETY: ours, made by `drop_texture`.
+        object::release_boxed::<Resource>(texture);
+    }
+
+    /// A title texture of `dimension` and `flags`, in memory of ours.
+    ///
+    /// (Windows only: off it there is no host, and nothing makes a copy.)
+    #[cfg(windows)]
+    fn drop_texture(dimension: u32, format: u32, flags: u32) -> This {
+        let desc = ResourceDesc {
+            dimension,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags,
+            ..buffer(0)
+        };
+        let mut out = std::ptr::null();
+        let hr = create_committed(
+            std::ptr::null(),
+            &PROPERTIES,
+            0,
+            &desc,
+            0,
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut out,
+        );
+        assert_eq!(hr, S_OK);
+        out
+    }
+
+    /// A host copy nothing names is let go at the next look and made again
+    /// at the next use ([`let_go_one`], [`hosted`]).
+    #[cfg(windows)]
+    #[test]
+    fn a_host_copy_let_go_is_made_again() {
+        use std::sync::atomic::Ordering::Relaxed;
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        // R8G8B8A8 and one level of 64x64: a format and a shape the host has.
+        let texture = drop_texture(3, 28, 0);
+        assert!(fills(&resource(texture).desc));
+        let first = host_copy(texture).expect("a host copy");
+        let (bytes, serial) = (first.bytes, first.serial);
+        let r = resource(texture);
+        // A list that holds the copy holds it against the sweep.
+        assert!(let_go_one(texture as usize, r, 0, 0).is_none(), "a list holds it");
+        // No list and no slot: the copy is the texture's alone, and goes.
+        drop(first);
+        assert!(let_go_one(texture as usize, r, 0, 0).is_some(), "a copy nothing names goes");
+        assert!(r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+        assert!(r.host.gone.load(Relaxed));
+        // The next use makes another one, of the same bytes.
+        let again = host_copy(texture).expect("a host copy made again");
+        assert!(again.serial != serial, "a new copy, not the old one");
+        assert_eq!(again.bytes, bytes);
+        // SAFETY: a live texture.
+        let d = unsafe { again.texture.GetDesc() };
+        assert_eq!((d.Width, d.Height, d.MipLevels), (64, 64, 1));
+        drop(again);
+        // Ours, made by `drop_texture`.
+        object::release_boxed::<Resource>(texture);
     }
 }

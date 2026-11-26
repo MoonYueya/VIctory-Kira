@@ -1453,6 +1453,13 @@ impl Staging {
     }
 }
 
+/// The bytes of a title texture's staging buffer, or 0 if it has none
+/// (what a host copy let go takes with it).
+pub(crate) fn staged_bytes(resource: This) -> u64 {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref().and_then(|map| map.get(&(resource as usize))).map_or(0, |s| s.bytes)
+}
+
 /// Lets go of a title texture's staging buffer (lists that recorded an
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
