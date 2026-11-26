@@ -784,3 +784,138 @@ the per-frame log `framelog.rs` or the card meter `cardmeter.rs` (both
 comparison is by what the code does, not by the commit graph.
 Full numbers, run ids and grades: `VIctory-Kira-reports/VK-CPUPROF-1-2026-11-27.md`
 (outside this repository).
+
+## Leaving out a texture's largest levels (RTX 3080, 2026-11-27)
+
+*Not merged into `main`: the code is on the branch `experiment/dropmips` (`e9aed88`); `main` has no `VICTORY_TEXTURE_DROP_MIPS`.*
+
+soldsawn/victory-nvidia-8gb offers `VICTORY_TEXTURE_DROP_MIPS=N` (b4ff304, 68e6f6a, 7d0e398,
+fc4b3dd, bd2ccd8, c09a44e): host copies of 2D textures the title fills leave out their N
+largest levels, so each keeps about a quarter of its bytes per level. **Off by default, and
+it stays off here.**
+
+Two runs of one binary (`e9aed88`), the same switches, one variable:
+
+| world | off | `=1` |
+|---|---|---|
+| frames / median / worst | 75 / 346 ms / 749 ms | 71 / 402 ms / 1,186 ms |
+| draws median | 4,856 | 4,782 |
+| median by draws (500-1999 / 2000-3999 / 4000+) | 259 / 337 / 353 ms | 329 / 356 / 408 ms |
+| card use / budget, last | 8,920 / 7,417 MB | 10,293 / 7,229 MB |
+| over budget | +1,503 MB | **+3,064 MB** |
+| lack of room, last | 649 | **2,079** |
+| passed over unmapped, last | 15,184 | 10,723 |
+| blocks of texture memory | 2,624 MB / 41 | **4,032 MB / 63** |
+| host copies the title fills | 17,658 / 1,603 MB | 13,964 / 1,840 MB |
+| picture mean / sd | 72 / 38 | 68 / 40 |
+| device removed / panic / untranslated | 0 / 0 / 0 | 0 / 0 / 0 |
+| levels left out | - | 15,584 copies, 10,873 MB |
+
+The mechanism works: detiling, level-by-level copies, read backs and shifted views all ran,
+no device was lost, and 15,584 host copies kept 10,873 MB worth of levels off the card. But
+**the card ended fuller, not emptier**: the block pool grew by 1,408 MB across 22 more blocks
+while the bytes of texturing the title fills rose 15 % on 21 % fewer copies. Smaller textures
+fragment the 64 MiB blocks faster than they save, and the higher pass rate brings more
+textures onto the card. Frame time followed the pool, not the savings: 16 % slower, +15.7 %
+in the busiest draws bucket.
+
+Two things the port needed that upstream did not have, both found by running it: `detile`
+added the level offset twice (once through `staging_layout`, once per part), and the
+staging check reported the title's whole extent, so every reduced texture counted as "not
+all here" and was looked at again 120 frames later (passed over unmapped 4,403 -> 13,454
+before the fix). Neither changes the outcome above.
+
+Numbers, run ids and grades: `VIctory-Kira-reports/VK-DROPMIPS-1-2026-11-27.md` (outside
+this repository).
+
+### A thread's memory of its asks for host copies (`VICTORY_LOOKUP_CACHE`, off by default)
+
+*Not merged into `main`: the code is on the branch `experiment/lookup` (`f198016`); `main` keeps its older `VICTORY_QUICK_FIND`.*
+
+Ported from `fxceless/victory-gta6` (`32be36d` plus the `bc6ee68` ordering fix, fork pull
+requests #1237 and #1245; `f198016` on the branch `experiment/lookup`, not merged into
+`main`). Every bind of a draw asks the buffer table for the host copy of each buffer it
+reads, and the title asks for the same ranges again and again. A thread now keeps what
+each ask `(address, length, kind)` found, weakly, for as long as the tables have not
+changed; the count of changes is made on the side of each change (an entry that comes is
+counted after it is in, a copy that leaves before it leaves, both under the table's lock),
+and a remembered answer is used only if the count is still the one it was read at.
+
+**It works, and it does not help here.** On the RTX 3080, the reference switch set, one
+diagnostics build, one shader and pipeline cache, the same save template and key schedule,
+430 s in the world each (run ids `ctlA1` off, `ctlB1` and `ctlB2` on):
+
+| world frames, median | `ctlA1` off | `ctlB1` on | `ctlB2` on |
+|---|---|---|---|
+| asks answered from the thread's memory | 0 % | **78.7 %** | **78.8 %** |
+| asks that went to the tables, per frame | 439,000 | 83,000 | 88,000 |
+| frame time, median | **417.2 ms** | 522.8 ms | 520.4 ms |
+| of it preparing a submission | **50.8 ms** | 65.3 ms | 57.1 ms |
+| on the GPU | 70.3 ms | 39.6 ms | 57.2 ms |
+| the card idle, median | **161.7 ms** | 258.4 ms | 283.6 ms |
+| card use / budget, last | 8,656 / 7,035 MB | 8,176 / 7,426 MB | 9,114 / 7,504 MB |
+| lack of room, last | 516 | 507 | 309 |
+| passed over unmapped, last | 12,480 | 12,445 | 8,658 |
+| private memory, peak | 27,575 MB | 26,887 MB | 27,602 MB |
+| free physical, least | 344 MB | 930 MB | 438 MB |
+| device removed / panic / untranslated | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+The cache is doing what it says — nearly four asks in five are answered without touching
+the tables, and the asks that reach them drop by 80 %. The time they were expected to save
+does not appear: preparing a submission got *slower* by 12 to 28 %, and the frame went with
+it. Two things point at the same reading. First, this tree already remembers buffer answers
+per thread (`VICTORY_QUICK_FIND`, `a1bdba4`), so the asks #1237 was written against are not
+the asks this branch makes: the table lookup was measured at 7 % of the recording threads'
+time here, not 54 ms a frame. Second, the deferred work the cache adds (`tables_changed()`
+on every registration, release and window, a `SeqCst` counter on the hot path, a hash map per
+thread) lands on the same recording threads, and the frame line now shows the card idle
+longer, not shorter: the bottleneck moved away from the lookup rather than out of the frame.
+
+It is not taken as a default, and `play.ps1` is unchanged. What would make it worth another
+run: start from a tree with `VICTORY_QUICK_FIND` removed (so the asks it caches are the ones
+the title actually makes), and measure the lookup itself with `VICTORY_PROFILE` before and
+after rather than the frame as a whole.
+
+## Two external commits read against this tree, RTX 3080 (one ported behind a switch, one already here)
+
+`TaynanGT/Vice-Tay 31e8d23` gives a flight's dynamic descriptor slots back when the
+flight lands instead of at the bury-lag reset 64 flights later, on a host whose
+shader-visible view heap is capped at 1,000,000 slots. **Read against this tree it is
+already here**: `release_completed_tables` (`host.rs`) gives the slots of every flight
+whose fence has completed back through `Detached::release_tables` -> `State::tables_done`,
+on both landing paths and *before* the list is pushed into `line.landed` (`relay_land`
+and `settle`). `bury_lag` holds the host list and its upload memory here, not the slots.
+The upstream commit reaches the same result on top of its own `release_tables` call (its
+parent `d3626d2` already had it); nothing was cherry-picked and no run was spent on it.
+
+That the symptom is absent here is measured, not only read: four runs on the RTX 3080
+(`785da6d`, 420 s of world each, `VICTORY_MEMORY_CATEGORIES=1`) asked for 12,704 to 13,762
+dynamic tables a frame, were **refused none**, dropped **no draw for want of a slot**, and
+peaked at 143,242 to 186,502 slots in use of the 279,998 the region holds (51 to 67 %).
+`bbcdb0a` sizes that region from where the title's heap ends, which is what keeps it out
+of the title's way on this host.
+
+`edsuuu/VI-BR-PORT 87dc3075` compacts a full list of changed memory ranges instead of
+clearing it, so a texture uploaded already is not left with old bytes after its memory
+changed. **That half was missing here**: both `remapped` and `page_written` cleared at
+1<<15. It is ported as `4c8ac33` (author kept) behind `VICTORY_CHANGES_COMPACT=1`, off by
+default, with `make_room` so both branches are tested; the default keeps the old cap and
+the old clear, so one binary can be measured against itself.
+
+| world frames, by draws | A (off) median ms | B (on) median ms |
+|---|---|---|
+| 3,000 to 4,500 | 356.6 (n=12) | 366.9 / 377.6 (n=20 / 22) |
+| 4,500 to 5,500 | 369.0 (n=17) | 365.9 / 374.1 (n=20 / 18) |
+| 5,500 and more | 448.5 (n=16) | 462.4 / 440.1 (n=17 / 15) |
+
+Nothing there is worth a default: no metric moves by more than 10 %, and CPU preparation
+in the busiest bucket moves 5.7 to 9.3 % toward better, inside the noise. The reason is in
+the logs: **the branch the switch changes never ran in these runs**. Both counters that
+count a change range being dropped read **0** in all four (`... (0 dropped)` for the
+ranges under texture views, and 0 kept-then-dropped for the page writes). The defect the
+port fixes does not reproduce in the opening and the first 420 s of the world here, so
+these runs can neither prove nor disprove it; the switch stays off. Four runs, one binary,
+the same cache; A and B entered different scenes (world draws medians 4,079 to 5,023), so
+only draws buckets are compared. 0 device removals, 0 panics, 0 shaders untranslated in
+all four. Full numbers and run ids: `VIctory-Kira-reports/VK-SLOTS-1-2026-11-26.md`
+(outside this repository).

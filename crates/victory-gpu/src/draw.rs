@@ -281,6 +281,38 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
     live.iter().map(|s| (s.id(), s.buffer.clone())).collect()
 }
 
+/// Whether a single record that misses its window is gathered: given a
+/// slot that the list's prelude fills in one pass with the list's other
+/// such records, in place of a pass of ours in front of its draw
+/// (`crate::indirect::gather`; `VICTORY_INDIRECT_GATHER=1`; `alt`: twenty
+/// seconds with, twenty without, in turn, each change said in the log).
+/// Off by default. Needs [`windows`], and serves only records no batch
+/// took ([`batches`]).
+fn gathers() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_INDIRECT_GATHER").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "single indirect records are gathered for their list's prelude from now (VICTORY_INDIRECT_GATHER=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -352,6 +384,13 @@ pub(crate) struct State {
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
+}
+
+/// A draw or dispatch whose table or root view found no dynamic descriptor
+/// slot, and is dropped rather than run with the title's own offsets.
+fn dropped_for_no_slot() {
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::DynamicDroppedDraws, 1);
 }
 
 impl Drop for State {
@@ -1777,6 +1816,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = self.reserve_dynamic(heap, host, 1) else {
+                    dropped_for_no_slot();
                     return false;
                 };
                 if let Some((a, s)) = &shadow {
@@ -1847,6 +1887,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = self.reserve_dynamic(heap, host, 1) else {
+                    dropped_for_no_slot();
                     return false;
                 };
                 self.root_srv_slots
@@ -2430,6 +2471,13 @@ impl State {
                 }
             };
             let texture = crate::resource::host_resource(resource);
+            // The card had no memory for its host copy and may have it now:
+            // this slot waits for that retry instead of being uploaded from
+            // a copy that is not there (`VICTORY_TEXTURE_RESCHEDULE=1`).
+            if texture.is_none() && crate::resource::host_retry_at(resource).is_some() {
+                host.texture_slot_later(index, write, frame, most);
+                continue;
+            }
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
                 at_once();
@@ -2622,10 +2670,22 @@ impl State {
         });
     }
 
+    /// Whether the shaders of the pipeline bound now can store to buffers
+    /// (or the pipeline is not known): a draw with them may write the
+    /// arguments of draws after it, which ends a list's gathering
+    /// (`crate::indirect::gather`). The same test keeps such a draw out of
+    /// a window ([`windows`]).
+    fn may_store(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
+        if gathers() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3020,6 +3080,9 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.window = None;
+        if gathers() && self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3320,6 +3383,7 @@ impl State {
             let Some(first) = self.reserve_dynamic(heap, host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
+                dropped_for_no_slot();
                 made.push((slot, u32::MAX));
                 continue;
             };
@@ -3508,6 +3572,9 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        if gathers() && self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3617,6 +3684,9 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        if gathers() && self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3836,6 +3906,13 @@ impl State {
         if !windowed || list.first_use(WINDOW_USE) {
             self.window = None;
         }
+        if !windowed {
+            // A dispatch, or shaders that store to buffers: arguments may
+            // be written from here on.
+            if gathers() {
+                list.gather_close();
+            }
+        }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
         let hit = self
             .window
@@ -3843,9 +3920,28 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
-        let (bounded, at) = match batch.or(hit) {
-            Some(hit) => hit,
-            None => {
+        // A record that misses its window and its batch: a slot the list's
+        // prelude fills, if the list still gathers ([`gathers`]).
+        let gathered = if batch.is_none() && hit.is_none() && windowed && gathers() {
+            let slot = crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride));
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                if slot.is_some() { crate::copystat::C::IndirectGathered } else { crate::copystat::C::IndirectGatherMissed },
+                1,
+            );
+            slot
+        } else {
+            None
+        };
+        let (bounded, at) = match (batch.or(hit), gathered) {
+            (Some(hit), _) => hit,
+            (None, Some((scratch, at))) => {
+                // The record's bytes are up to date when the list is
+                // submitted, as for a record clamped in the list.
+                args.refresh(list, arguments, len);
+                (scratch, at)
+            }
+            (None, None) => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart

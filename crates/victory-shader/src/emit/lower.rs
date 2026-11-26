@@ -7428,12 +7428,25 @@ impl<'a> Lower<'a> {
                 .collect()
         };
         let words = if total < 32 {
-            // A byte or half inside the dword that holds it.
-            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-            let at = self.s.m.bin(c, Bin::And, off, not3);
+            // A byte or half inside the dword that holds it. A constant
+            // offset is aligned here: vkd3d-proton turns a load at a
+            // constant offset into the same access as the buffer's other
+            // accesses, and one at a computed offset into a per-component
+            // raw access, which on NVIDIA does not see a dword the same
+            // invocation stored just before.
+            let (at, sh) = match align_constants().then(|| self.s.m.int_value(off)).flatten() {
+                Some(o) => {
+                    let (at, sh) = aligned_load(o as u32);
+                    (self.s.m.i32(at), self.s.m.i32(sh))
+                }
+                None => {
+                    let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+                    let at = self.s.m.bin(c, Bin::And, off, not3);
+                    let byte = self.s.m.bin(c, Bin::And, off, three);
+                    (at, self.s.m.bin(c, Bin::Shl, byte, three))
+                }
+            };
             let w = load(self, at, 1)[0];
-            let byte = self.s.m.bin(c, Bin::And, off, three);
-            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
         } else {
             load(self, off, total / 32)
@@ -13166,6 +13179,23 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
     })
 }
 
+/// Whether a load at a constant offset has its dword aligned at compile
+/// time (`VICTORY_SHADER_ALIGNED_LOADS=1`; off: computed as before).
+///
+/// vkd3d-proton folds a load at a constant offset into the buffer's other
+/// accesses and turns one at a computed offset into a per-component raw
+/// access, which on NVIDIA does not see a dword the same invocation stored
+/// just before. The bytes loaded are the same either way.
+/// The dword a load at byte offset `o` reads and the shift that brings the
+/// wanted byte or half down: the same numbers the computed path works out
+/// at run time, in one place so a test can check them against it.
+fn aligned_load(o: u32) -> (u32, u32) {
+    (o & !3, (o & 3) * 8)
+}
+fn align_constants() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_ALIGNED_LOADS").is_some_and(|v| v == "1"))
+}
 #[cfg(test)]
 mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
@@ -13298,6 +13328,28 @@ mod tests {
         assert_eq!(packed_half(&sig, &[(8, None)], 8, 0), None);
     }
 
+
+    /// A load at a constant offset reads the dword the computed path would
+    /// read, and shifts down by the byte it wants: the two must agree for
+    /// every offset, or a shader would read different bytes with the switch
+    /// on than with it off.
+    #[test]
+    fn aligned_load_agrees_with_the_computed_offset_for_every_byte() {
+        for o in 0..4096u32 {
+            let (at, sh) = super::aligned_load(o);
+            // The computed path: And with !3, the byte from And with 3.
+            assert_eq!(at, o & !3, "offset {o}");
+            assert_eq!(sh, (o & 3) * 8, "offset {o}");
+            // And the byte it brings down is the byte at that offset.
+            assert!(at <= o && o < at + 4, "offset {o} is inside the dword");
+            assert_eq!(at + sh / 8, o, "offset {o} comes down to itself");
+        }
+        // And a half at a constant offset lands on the same dword.
+        for o in (0..4096u32).step_by(2) {
+            let (at, _) = super::aligned_load(o);
+            assert_eq!(at, o & !3);
+        }
+    }
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();

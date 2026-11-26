@@ -6,6 +6,7 @@
 #               resolution and sizes its memory down (the picture is softer; see docs/findings.md)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
+# -NoWarm       skip making the pipelines the last run drew with before it starts
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -13,7 +14,8 @@ param(
     [switch]$RayTracing,
     [switch]$SeriesS,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    [switch]$NoWarm
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -60,4 +62,22 @@ Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-O
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute --console $console } finally { Pop-Location }
+try {
+    # Pipelines the last run drew with, made before this one draws. A cold library doubles
+    # the frame time while the world compiles what it needs (773 pipelines made in the
+    # world's frames against 44 with the library warm), so the list the last run left
+    # beside the library is warmed first. No list, nothing to warm. -NoWarm skips it.
+    if (-not $NoWarm) {
+        $cache = $env:VICTORY_CACHE_DIR
+        if (-not $cache -and (Test-Path 'victory.toml')) {
+            $line = Select-String -Path 'victory.toml' -Pattern '^\s*cache_dir\s*=\s*"(.*)"' | Select-Object -First 1
+            if ($line) { $cache = $line.Matches[0].Groups[1].Value }
+        }
+        if (-not $cache) { $cache = Join-Path $env:LOCALAPPDATA 'victory\cache' }
+        if (Test-Path (Join-Path $cache 'pipelines\early-pipelines.txt')) {
+            # Quiet: its output belongs in a run's log, not in the window this starts from.
+            & $victory warm --used *> $null
+        }
+    }
+    & $victory run $Exe --execute --console $console
+} finally { Pop-Location }

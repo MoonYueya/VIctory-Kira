@@ -1354,6 +1354,9 @@ pub(crate) struct HostList {
     epoch: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// The records its draws read from slots that its prelude fills
+    /// (`crate::indirect::gather`).
+    gather: Mutex<Gather>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1366,6 +1369,24 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// What a list gathers for its prelude to clamp (`crate::indirect::gather`).
+#[derive(Default)]
+struct Gather {
+    /// Something recorded in the list may write arguments: no record is
+    /// gathered from here on (the ones gathered before are read before
+    /// the list runs, which is before that).
+    closed: bool,
+    /// One set per argument buffer, kind and stride.
+    sets: Vec<crate::indirect::GatherSet>,
+    /// The budget words the gathered records are charged to.
+    budget: Option<ID3D12Resource>,
+    /// Scratch buffers of earlier recordings, kept for the next sets.
+    spare: Vec<ID3D12Resource>,
+}
+
+/// The most argument buffers a list gathers from.
+const GATHER_SETS: usize = 8;
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -3491,6 +3512,10 @@ fn late_helper() {
             if line().target != target {
                 continue;
             }
+            // The card has finished them all: a meter of what the title waits
+            // on can tell a hold here from a wait for the card itself.
+            #[cfg(feature = "diagnostics")]
+            crate::fence::lag::card_done();
             host.settle(&mut submitted, WHY_CARD_DONE);
         }
         land();
@@ -4289,6 +4314,7 @@ impl Host {
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 _alive: Counted::new(),
+                gather: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes,
                 #[cfg(feature = "diagnostics")]
@@ -6430,6 +6456,18 @@ impl HostList {
         self.batches_common();
         self.card_budget_out();
         self.take_coming();
+        // The scratch buffers its prelude fills and leaves readable as
+        // arguments: common again behind the list, as every scratch buffer.
+        for set in self.gather.lock().unwrap_or_else(|e| e.into_inner()).sets.iter().filter(|s| s.records() > 0) {
+            // SAFETY: an open list and a live buffer.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    &set.scratch,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -6482,6 +6520,16 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            let Gather { closed, sets, spare, .. } = &mut *gather;
+            *closed = false;
+            for set in sets.drain(..) {
+                if spare.len() < GATHER_SETS {
+                    spare.push(set.into_scratch());
+                }
+            }
+        }
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -6844,7 +6892,10 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        // The records the list's draws read from slots (`crate::indirect::gather`).
+        let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        let gathered = gather.sets.iter().any(|s| s.records() > 0);
+        if barriers.is_empty() && syncs.is_empty() && !gathered {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6868,6 +6919,18 @@ impl HostList {
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
+                if gathered {
+                    // The slots must hold clamped records before a draw
+                    // reads them: a prelude that cannot record the passes
+                    // is no prelude.
+                    let filled = match &gather.budget {
+                        Some(budget) => crate::indirect::record_gathers(list, &gather.sets, budget),
+                        None => false,
+                    };
+                    if !filled {
+                        fail(format_args!("a list's gathered indirect records could not be clamped in its prelude"));
+                    }
+                }
                 list.Close()
             })
         };
@@ -6875,6 +6938,73 @@ impl HostList {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
         list.cast().ok()
+    }
+
+    /// From here on the list gathers no records (`crate::indirect::gather`):
+    /// what is about to be recorded may write arguments.
+    pub(crate) fn gather_close(&self) {
+        self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+    }
+
+    /// A slot for the record at `offset` of the host copy `src` in the
+    /// scratch buffer the list's prelude fills (`crate::indirect::gather`,
+    /// which checked the record): the buffer and the slot's place in it.
+    pub(crate) fn gather_slot(&self, src: &ID3D12Resource, src_id: u64, offset: u32, (kind, stride): (u32, u32)) -> Option<(ID3D12Resource, u64)> {
+        let none = |why: usize| {
+            crate::indirect::GATHER_NONE[why].fetch_add(1, Ordering::Relaxed);
+            None
+        };
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        if gather.closed {
+            return none(1);
+        }
+        let found = gather
+            .sets
+            .iter()
+            .position(|s| s.src_id == src_id && s.kind == kind && s.stride == stride && s.src.as_raw() == src.as_raw());
+        let at = match found {
+            Some(at) => at,
+            None => {
+                if gather.sets.len() >= GATHER_SETS {
+                    return none(2);
+                }
+                // The prelude zeroes the budget as the list zeroes its own.
+                if self.list.cast::<ID3D12GraphicsCommandList2>().is_err() {
+                    return none(4);
+                }
+                let Some(host) = host() else {
+                    return none(4);
+                };
+                if gather.budget.is_none() {
+                    let Some(budget) = host.uav_buffer(256) else {
+                        return none(4);
+                    };
+                    name(&budget, || "indirect budget of gathered records".to_owned());
+                    gather.budget = Some(budget);
+                }
+                let scratch = match gather.spare.pop() {
+                    Some(scratch) => scratch,
+                    None => {
+                        let Some(scratch) = host.uav_buffer(u64::from(crate::indirect::GATHER_MOST) * u64::from(crate::indirect::GATHER_STRIDE)) else {
+                            return none(4);
+                        };
+                        name(&scratch, || "indirect arguments, gathered".to_owned());
+                        scratch
+                    }
+                };
+                let Some(table) = self.scratch(u64::from(crate::indirect::GATHER_MOST) * 4) else {
+                    gather.spare.push(scratch);
+                    return none(4);
+                };
+                gather.sets.push(crate::indirect::GatherSet::new(src.clone(), src_id, (kind, stride), scratch, table));
+                gather.sets.len() - 1
+            }
+        };
+        let set = &mut gather.sets[at];
+        let Some(slot) = set.slot(offset) else {
+            return none(3);
+        };
+        Some((set.scratch.clone(), u64::from(slot) * u64::from(stride)))
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -7727,6 +7857,22 @@ fn split_line(frames: f64) {
 /// spread over the threads kept for the snapshots (`crate::shadow::wide`).
 /// The write-watch journal and the guards are behind their own locks, as
 /// they are for the title's threads.
+/// Whether the heavy watch mode's refreshes go to the kept threads by
+/// index (`VICTORY_WIDE_HEAVY=1`) or as one job a copy, as before.
+///
+/// A job a copy is a boxed closure in a queue for each of them (thousands
+/// of them, the heap's buffer views once a frame); an index into one taken
+/// vector is what the light mode has always used. Neither copies different
+/// bytes (`parallel_and_serial_buffer_refreshes_copy_the_same_merged_ranges`).
+fn wide_heavy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if std::env::var_os("VICTORY_WIDE_HEAVY").is_some_and(|v| v == "1") {
+            return true;
+        }
+        wide_refresh()
+    })
+}
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -8281,7 +8427,7 @@ impl Batch {
         #[cfg(feature = "diagnostics")]
         let (began, all) = (std::time::Instant::now(), self.refreshes.len());
         let _flush = crate::timeline::span("refreshes of copies");
-        self.flush_all();
+        self.flush_all(wide_heavy());
         #[cfg(feature = "diagnostics")]
         {
             SPLIT[6].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -8290,7 +8436,7 @@ impl Batch {
         }
     }
 
-    fn flush_all(&mut self) {
+    fn flush_all(&mut self, parallel: bool) {
         // Most of a flush's copies are as they were: they are told so here,
         // from what the submission's asking found, before anything is asked
         // and any thread woken. (Thousands of them, the heap's buffer views
@@ -8320,7 +8466,7 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        if parallel && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
@@ -8328,26 +8474,20 @@ impl Batch {
             let before = PREPARING[0].load(Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
-            if light {
-                // A number to a free thread, not a job to each copy.
-                let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        #[cfg(feature = "diagnostics")]
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                    Self::update(shadow, *from, *to);
-                });
-            } else {
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                    .refreshes
-                    .drain(..)
-                    .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
-                    .collect();
-                crate::shadow::wide_run(jobs);
-            }
+            // A number to a free thread, not a job to each copy, whichever
+            // watch mode: the light one dropped the copies that changed
+            // nothing here first, the heavy one cannot (nothing_new is only
+            // meaningful when view memory is tracked).
+            let refreshes = std::mem::take(&mut self.refreshes);
+            crate::shadow::wide_each(refreshes.len(), move |i| {
+                let (shadow, from, to) = &refreshes[i];
+                if light && refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
+                    #[cfg(feature = "diagnostics")]
+                    FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Self::update(shadow, *from, *to);
+            });
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
@@ -10707,6 +10847,41 @@ mod refresh_tests {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
+
+    /// A flush copies the same bytes whether its copies go one at a time or
+    /// several at a time: the parallel path must not drop or reorder what a
+    /// copy writes, in either watch mode.
+    #[test]
+    fn parallel_and_serial_buffer_refreshes_copy_the_same_merged_ranges() {
+        const COPIES: usize = 16;
+        const LEN: usize = 4096;
+        let refresh = |parallel: bool| {
+            let source: Vec<Vec<u8>> = (0..COPIES)
+                .map(|i| (0..LEN).map(|byte| (i + byte * 3) as u8).collect())
+                .collect();
+            let mut output = vec![vec![0xffu8; LEN]; COPIES];
+            let mut batch = Batch::default();
+            for (input, output) in source.iter().zip(&mut output) {
+                let start = input.as_ptr() as usize;
+                let copy =
+                    crate::shadow::Shadow::unbacked(start as u64, output.as_mut_ptr(), LEN as u64, false);
+                batch.add(&copy, start + 128, 1024);
+                batch.add(&copy, start + 1024, 1024);
+            }
+            assert_eq!(batch.refreshes.len(), COPIES, "one entry a copy, merged");
+            batch.flush_all(parallel);
+            assert!(batch.refreshes.is_empty(), "a flush takes every copy");
+            for (input, output) in source.iter().zip(&output) {
+                assert_eq!(&output[128..2048], &input[128..2048]);
+                assert!(
+                    output[..128].iter().chain(&output[2048..]).all(|&byte| byte == 0xff),
+                    "nothing else was written"
+                );
+            }
+            output
+        };
+        assert_eq!(refresh(true), refresh(false));
+    }
     use super::{Batch, RamBand, ram_band};
     use std::sync::Arc;
 

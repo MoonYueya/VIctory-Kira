@@ -123,6 +123,25 @@ impl Made {
     }
 }
 
+/// The dynamic slots taken and not yet given back, across every view heap,
+/// and the most taken at one time (diagnostics only).
+#[cfg(feature = "diagnostics")]
+static IN_USE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static IN_USE_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The most dynamic descriptor slots taken at one time so far; 0 without
+/// diagnostics. Unlike the counters of `crate::copystat` it is a reading,
+/// not a count of what happened since the last report.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn in_use_peak() -> u64 {
+    IN_USE_PEAK.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[cfg(not(feature = "diagnostics"))]
+pub(crate) fn in_use_peak() -> u64 {
+    0
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -730,8 +749,9 @@ const PAGE_WRITE_AFTER: u64 = 2;
 /// ranges; locks one mutex and calls nothing.
 pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    // Ranges kept until a pass takes them (as many as [`remapped`] keeps
+    // with `VICTORY_CHANGES_COMPACT=1`, else the 2^15 it had).
+    let most = if changes_compact() { 1 << 18 } else { 1 << 15 };
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
@@ -744,9 +764,9 @@ pub(crate) fn page_written(at: usize, len: usize) {
         last.1 = end;
         return;
     }
-    if ranges.len() >= MOST {
+    if ranges.len() >= most {
         PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+        make_room(&mut ranges, most, changes_compact());
     }
     ranges.push((start, end));
 }
@@ -811,9 +831,45 @@ pub(crate) fn remapped(at: usize, len: usize) {
         // No pass runs (no shader that picks textures by index is bound):
         // the slots there are looked at when they are due, as before.
         STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+        make_room(&mut ranges, MOST, changes_compact());
     }
     ranges.push((start, end));
+}
+
+/// Whether a full list of changed ranges is compacted instead of cleared
+/// (`VICTORY_CHANGES_COMPACT=1`; off by default). Clearing it let a texture
+/// uploaded already keep old bytes after its memory changed: the intro's
+/// video frames went back during the streaming bursts (edsuuu/VI-BR-PORT
+/// 87dc3075, after fxceless/victory-fork PR #896).
+fn changes_compact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_CHANGES_COMPACT").as_deref() == Ok("1"))
+}
+
+/// A full list of changed ranges makes room for the next one: compacted
+/// (every change kept, [`compact`]) when `keep`, else cleared, as it was
+/// before the switch.
+fn make_room(ranges: &mut Vec<(u64, u64)>, most: usize, keep: bool) {
+    if keep {
+        compact(ranges, most);
+    } else {
+        ranges.clear();
+    }
+}
+
+/// A full list of changed ranges made room in, keeping every change: those
+/// that touch or overlap made one, then, while more than half of `most` are
+/// left, each two neighbours one range over both (a pass looks at a little
+/// more memory than changed). Clearing the list here instead (as before) let
+/// a texture uploaded already keep old bytes after its memory changed: the
+/// intro's video frames went back during the streaming bursts (after
+/// fxceless/victory-fork PR #896, ported to our tree as 95cddb7f).
+fn compact(ranges: &mut Vec<(u64, u64)>, most: usize) {
+    join(ranges);
+    while ranges.len() > most / 2 {
+        let wide: Vec<(u64, u64)> = ranges.chunks(2).map(|pair| (pair[0].0, pair[pair.len() - 1].1)).collect();
+        *ranges = wide;
+    }
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -889,6 +945,40 @@ struct Waiting {
     checked: (u64, u64, u64, u8, u64),
 }
 
+
+/// Whether a slot the host refused for lack of memory is left eligible for
+/// another mirror (`VICTORY_TEXTURE_RESCHEDULE=1`; off: it is noted as
+/// made, as before, and only the texture's own retries reach it).
+fn retry_slots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_RETRY").is_some_and(|v| v == "1"))
+}
+
+/// Whether the view's texture has a retry pending: its host copy was
+/// refused for lack of memory and may be asked for again
+/// (`crate::resource::host_retry_at`).
+#[cfg(windows)]
+fn refused_now(view: &View) -> bool {
+    match view {
+        View::Shader(resource, _) | View::Unordered(resource, _, _) => {
+            crate::resource::host_retry_at(*resource as _).is_some()
+        }
+        View::Placed(false, resource, desc) if resource[0] != 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            crate::resource::texture_at_made(address, resource)
+                .is_some_and(|at| crate::resource::host_retry_at(at).is_some())
+        }
+        _ => false,
+    }
+}
+/// Whether a slot that is given work of its own stops waiting for card
+/// space (`VICTORY_TEXTURE_RESCHEDULE=1`; off: it keeps the wait, as
+/// before).
+fn reschedule_holds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_RESCHEDULE").is_some_and(|v| v == "1"))
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -960,6 +1050,18 @@ impl TextureQueue {
         self.slots.get_mut(&index).filter(|w| w.write == write)
     }
 
+    /// A new wait for memory, or a recheck, supersedes a hold for the same
+    /// write: the slot is not waiting for card space any more, it has work
+    /// of its own at a frame of its own. (`hold` used to outlive the
+    /// condition it was taken for: `room` would then bring the slot back
+    /// at a frame the later state had already moved past.)
+    fn reschedule(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
+        if reschedule_holds() && self.held.get(&index) == Some(&write) {
+            self.held.remove(&index);
+        }
+        self.same(index, write)
+    }
+
     /// Slot `index` is up to date: out of the queue until written again.
     fn done(&mut self, index: u32, write: u64) {
         if self.same(index, write).is_some() {
@@ -970,7 +1072,7 @@ impl TextureQueue {
     /// Nothing to upload at slot `index` now: looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
     fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
         }
@@ -1010,7 +1112,7 @@ impl TextureQueue {
     /// Slot `index` was uploaded with `mapped` bytes of its memory there,
     /// not all of it: looked at again from frame `due`.
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
         }
     }
@@ -1021,7 +1123,7 @@ impl TextureQueue {
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
     fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
         }
@@ -1728,7 +1830,14 @@ impl HostHeap {
             return None;
         };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            use crate::copystat::add;
+            add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+            // The slots taken now, against the most taken at one time.
+            let now = IN_USE.fetch_add(u64::from(n), Relaxed) + u64::from(n);
+            IN_USE_PEAK.fetch_max(now, Relaxed);
+        }
         Some(self.count + first)
     }
 
@@ -2564,6 +2673,8 @@ impl HostHeap {
             return;
         };
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).release(at, n);
+        #[cfg(feature = "diagnostics")]
+        IN_USE.fetch_sub(u64::from(n), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -3080,12 +3191,17 @@ impl HostHeap {
                 note_before(index, shown, if later { "null, waits" } else { "at once" });
             }
             self.quick_is(index, 0);
-            self.made.set(index, if later { 0 } else { key });
             let kept = if later {
                 None
             } else {
                 make_twinned(&view, self.at(index), self.twin(index))
             };
+            // A slot a temporary refusal left null is left eligible: the
+            // next mirror of it tries again instead of finding it made
+            // (`VICTORY_TEXTURE_RESCHEDULE=1`).
+            let retry = retry_slots() && kept.is_none() && !later && refused_now(&view);
+            let shown = if later || retry { 0 } else { key };
+            self.made.set(index, shown);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.at(index));
             }
@@ -3094,7 +3210,7 @@ impl HostHeap {
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
             self.keep(index, kept.flatten());
-            self.quick_is(index, if later { 0 } else { key });
+            self.quick_is(index, shown);
             drop(held);
             self.unmake_stale(index, stale);
         }
@@ -4769,6 +4885,37 @@ mod tests {
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
     }
 
+    /// A full list of changed ranges is made smaller, never emptied: every
+    /// change is still covered.
+    /// The switch decides: compacted (every change kept) or cleared, as
+    /// before it. Off by default, so the old path stays the one measured.
+    #[test]
+    fn a_full_change_list_is_cleared_or_compacted_by_the_switch() {
+        let full = || -> Vec<(u64, u64)> { (0..10u64).map(|i| (i * 10, i * 10 + 1)).collect() };
+        let mut off = full();
+        make_room(&mut off, 8, false);
+        assert!(off.is_empty(), "off: cleared, as before the switch");
+        let mut on = full();
+        make_room(&mut on, 8, true);
+        assert!(!on.is_empty() && on.len() <= 4, "on: made smaller, not emptied");
+        for i in 0..10u64 {
+            assert!(on.iter().any(|r| r.0 <= i * 10 && i * 10 + 1 <= r.1), "change {i} lost");
+        }
+    }
+
+    #[test]
+    fn a_full_change_list_keeps_every_change() {
+        let mut ranges: Vec<(u64, u64)> = (0..10u64).map(|i| (i * 10, i * 10 + 1)).collect();
+        compact(&mut ranges, 8);
+        assert!(ranges.len() <= 4);
+        for i in 0..10u64 {
+            assert!(ranges.iter().any(|r| r.0 <= i * 10 && i * 10 + 1 <= r.1), "change {i} lost");
+        }
+        let mut touching = vec![(0, 5), (5, 9), (20, 30)];
+        compact(&mut touching, 4);
+        assert_eq!(touching, [(0, 9), (20, 30)]);
+    }
+
     #[test]
     fn ranges_that_touch_are_one() {
         let mut ranges = vec![(40, 50), (30, 40), (35, 40), (10, 20), (45, 60), (60, 61), (1, 1)];
@@ -5138,6 +5285,42 @@ mod tests {
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
     }
 
+
+    /// A slot given work of its own stops waiting for card space: `room`
+    /// does not bring it back at the frame its hold was taken for, which
+    /// that work has moved past.
+    #[test]
+    fn a_rescheduled_slot_is_no_longer_held_for_card_space() {
+        if !reschedule_holds() {
+            return; // the switch is off in this run
+        }
+        let mut q = TextureQueue::default();
+        q.written(1, 0, 0, false);
+        let (slot, write) = q.due(0, 4)[0];
+        // Held back for a full card until frame 10.
+        q.hold(slot, write, 10);
+        assert_eq!(q.room(5), 1, "held for card space");
+        // Then given a recheck of its own at frame 20: it is not waiting
+        // for space any more.
+        q.hold(slot, write, 10);
+        q.recheck(slot, write, 20, (16, 8), 1, 0, 4);
+        assert_eq!(q.room(6), 0, "not waiting for card space");
+        assert!(q.due(19, 4).is_empty(), "not before its own frame");
+        assert_eq!(q.due(20, 4).len(), 1, "due at the frame the pass set");
+    }
+
+    /// A hold on a write that is gone is not brought back by `room`.
+    #[test]
+    fn a_held_slot_written_again_is_not_brought_back() {
+        let mut q = TextureQueue::default();
+        q.written(1, 0, 0, false);
+        let (slot, write) = q.due(0, 4)[0];
+        q.hold(slot, write, 10);
+        // The title writes it again: a new write, and the hold was for the
+        // old one. (A draw making the slot, seen, keeps the write.)
+        q.written(slot, 0, 0, false);
+        assert_eq!(q.room(5), 0, "the hold was for another write");
+    }
     /// Slots held back for lack of room on the card are not handed out
     /// until their frame, keep their place, are not counted as waiting
     /// for their memory, and all come back at once when the card has room;
