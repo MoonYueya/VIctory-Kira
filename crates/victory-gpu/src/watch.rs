@@ -306,13 +306,9 @@ const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
-/// Asks the kernel about many ranges `(start, end)` at once, before the
-/// [`writes`] of each: ranges close together are one asking, and `writes`
-/// then answers from the journal until [`ask_ahead_done`]. The world's
-/// submissions refresh thousands of host copies (6,664 askings a frame,
-/// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
-/// left to `writes`.
-pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+/// The pages of `ranges` to ask about, in order: `(start, end)` in pages,
+/// each once, view memory known by its bits left out.
+fn pages_of(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -320,10 +316,81 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
+    pieces.sort_unstable();
+    pieces
+}
+
+/// Whether an asking is made to a reservation's own end rather than to the
+/// start of the piece after it (`VICTORY_WATCH_RESERVATION=1`; off by
+/// default, and the asking is as it always was without it).
+///
+/// From stellarr-studio/kelvaroq patch 0045 (GPL-3.0-or-later), whose A/B on
+/// its own card put the median of a heavy frame at 129.2 → 109.5 ms: the
+/// kernel keeps its written pages by reservation, and one asking that spans
+/// two of them (or a hole between them) is refused, so the run was split by
+/// halves, asked again and again. Here the pieces of one reservation are
+/// asked for together, so a submission of thousands of copies asks once a
+/// reservation, and a refusal is not paid for first.
+fn by_reservation() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_RESERVATION").is_some_and(|v| v == "1"))
+}
+
+/// The end of the reservation holding page `first` (in pages), and whether
+/// it is the process's own committed private memory, which is what the
+/// kernel keeps written pages of: `None` if the query fails.
+#[cfg(windows)]
+fn reservation(first: usize) -> Option<(usize, bool)> {
+    use windows_sys::Win32::System::Memory::{
+        MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
+    // SAFETY: the query takes an address as its input and fills our
+    // structure; the size given is that structure's.
+    let ok = unsafe {
+        QueryVirtualMemoryInformation(
+            GetCurrentProcess(),
+            (first * PAGE) as *const _,
+            MemoryRegionInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of_val(&info),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let base = info.AllocationBase as usize;
+    let end = base.checked_add(info.RegionSize)? / PAGE;
+    // SAFETY: a successful query filled the flags; bit zero is "private".
+    Some((end, unsafe { info.Anonymous.Flags } & 1 != 0))
+}
+
+/// Without the query (anything but Windows), as before.
+#[cfg(not(windows))]
+fn reservation(_first: usize) -> Option<(usize, bool)> {
+    None
+}
+
+/// Whether two pieces may be asked about in one call when the first starts
+/// a reservation: not past [`AHEAD_MAX`], and not across a gap larger than
+/// the old eight MiB or than the smaller of the two pieces.
+fn can_join(first: usize, last: usize, (start, end): (usize, usize)) -> bool {
+    last.max(end) - first <= AHEAD_MAX && start.saturating_sub(last) <= AHEAD_GAP.max((last - first).min(end - start))
+}
+
+/// Asks the kernel about many ranges `(start, end)` at once, before the
+/// [`writes`] of each: ranges close together are one asking, and `writes`
+/// then answers from the journal until [`ask_ahead_done`]. The world's
+/// submissions refresh thousands of host copies (6,664 askings a frame,
+/// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
+/// left to `writes`.
+pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    let pieces = pages_of(ranges);
     if pieces.len() < 2 {
         return;
     }
-    pieces.sort_unstable();
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
     if journal().kept {
@@ -336,14 +403,27 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         let first = pieces[i].0;
         let mut last = pieces[i].1;
         let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
-            last = last.max(pieces[k].1);
-            k += 1;
+        if by_reservation() {
+            // One reservation at a time, to its own end: the answer of an
+            // asking that reaches past it is refused whole.
+            let limit = reservation(first).map_or(last, |(end, _)| end);
+            while k < pieces.len() && pieces[k].1 <= limit && can_join(first, last, pieces[k]) {
+                last = last.max(pieces[k].1);
+                k += 1;
+            }
+            if k - i >= 2 && !ask_joined(first, last, &mut asked, &mut written) {
+                ask_join_halves(&pieces[i..k], &mut asked, &mut written);
+            }
+        } else {
+            while k < pieces.len()
+                && pieces[k].0 <= last + AHEAD_GAP
+                && last.max(pieces[k].1) - first <= AHEAD_MAX
+            {
+                last = last.max(pieces[k].1);
+                k += 1;
+            }
+            ask_run(&pieces[i..k], &mut asked, &mut written);
         }
-        ask_run(&pieces[i..k], &mut asked, &mut written);
         i = k;
     }
     note_hot(&written);
@@ -654,6 +734,39 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
     let (a, b) = pieces.split_at(pieces.len() / 2);
     ask_run(a, asked, written);
     ask_run(b, asked, written);
+}
+
+/// One kernel asking for pages `[first, last)`, joined with the reservation
+/// it is in: whether it answered, and the pages found written are added to
+/// `written`. A refusal leaves nothing noted.
+fn ask_joined(first: usize, last: usize, asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) -> bool {
+    match kernel_written(first, last) {
+        Some(pages) => {
+            written.extend(pages);
+            asked.push((first, last));
+            true
+        }
+        None => false,
+    }
+}
+
+/// The pieces of one reservation, by halves, as [`ask_run`] does it: a
+/// reservation the kernel still refuses (memory that is not write-watched,
+/// a part of it remapped) is asked about in halves, the pieces of each
+/// asked together. A piece alone is left to [`writes`], asked a piece at a
+/// time as it always was.
+fn ask_join_halves(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
+    if pieces.len() < 2 {
+        return;
+    }
+    let first = pieces[0].0;
+    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    if ask_joined(first, last, asked, written) {
+        return;
+    }
+    let (a, b) = pieces.split_at(pieces.len() / 2);
+    ask_join_halves(a, asked, written);
+    ask_join_halves(b, asked, written);
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -3660,6 +3773,37 @@ mod tests {
                 VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
             }
         }
+    }
+
+    /// With `VICTORY_WATCH_RESERVATION` the pieces of one reservation are
+    /// asked about in one call, and the asking stops at the reservation's
+    /// end: a range that reaches into the next reservation is not carried
+    /// with it (the kernel would refuse the whole asking).
+    #[test]
+    fn a_reservation_is_asked_about_to_its_own_end() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let (end, private) = reservation(p / PAGE).expect("the query answers for our own memory");
+        assert!(end >= (p + 4 * PAGE) / PAGE, "the reservation ends at {end} pages, before our four");
+        assert!(private, "our own commit is private memory");
+        // Two pieces of it join, as they always did; a piece past the
+        // reservation's end is not carried with them (ask_ahead stops the
+        // group there), and two pieces too far apart never join.
+        let (first, last) = (p / PAGE, (p + PAGE) / PAGE);
+        assert!(can_join(first, last, (last, last + 1)));
+        assert!(!can_join(first, last, (end + AHEAD_MAX, end + AHEAD_MAX + 1)));
+        // Pages are asked in order, once each.
+        let pieces = pages_of(&[(p, p + 2 * PAGE), (p + PAGE, p + 3 * PAGE)]);
+        assert!(pieces.windows(2).all(|w| w[0] <= w[1]));
+        // The asking covers our four pages in one piece, and stops at the
+        // reservation's end.
+        assert_eq!(pieces[0].0, p / PAGE);
+        assert_eq!(pieces.last().map(|p| p.1), Some((p + 3 * PAGE) / PAGE));
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A write between another thread's asking about a range and the second
