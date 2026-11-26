@@ -2430,6 +2430,13 @@ impl State {
                 }
             };
             let texture = crate::resource::host_resource(resource);
+            // The card had no memory for its host copy and may have it now:
+            // this slot waits for that retry instead of being uploaded from
+            // a copy that is not there (`VICTORY_TEXTURE_RESCHEDULE=1`).
+            if texture.is_none() && crate::resource::host_retry_at(resource).is_some() {
+                host.texture_slot_later(index, write, frame, most);
+                continue;
+            }
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
                 at_once();

@@ -889,6 +889,40 @@ struct Waiting {
     checked: (u64, u64, u64, u8, u64),
 }
 
+
+/// Whether a slot the host refused for lack of memory is left eligible for
+/// another mirror (`VICTORY_TEXTURE_RESCHEDULE=1`; off: it is noted as
+/// made, as before, and only the texture's own retries reach it).
+fn retry_slots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_RETRY").is_some_and(|v| v == "1"))
+}
+
+/// Whether the view's texture has a retry pending: its host copy was
+/// refused for lack of memory and may be asked for again
+/// (`crate::resource::host_retry_at`).
+#[cfg(windows)]
+fn refused_now(view: &View) -> bool {
+    match view {
+        View::Shader(resource, _) | View::Unordered(resource, _, _) => {
+            crate::resource::host_retry_at(*resource as _).is_some()
+        }
+        View::Placed(false, resource, desc) if resource[0] != 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            crate::resource::texture_at_made(address, resource)
+                .is_some_and(|at| crate::resource::host_retry_at(at).is_some())
+        }
+        _ => false,
+    }
+}
+/// Whether a slot that is given work of its own stops waiting for card
+/// space (`VICTORY_TEXTURE_RESCHEDULE=1`; off: it keeps the wait, as
+/// before).
+fn reschedule_holds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_RESCHEDULE").is_some_and(|v| v == "1"))
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -960,6 +994,18 @@ impl TextureQueue {
         self.slots.get_mut(&index).filter(|w| w.write == write)
     }
 
+    /// A new wait for memory, or a recheck, supersedes a hold for the same
+    /// write: the slot is not waiting for card space any more, it has work
+    /// of its own at a frame of its own. (`hold` used to outlive the
+    /// condition it was taken for: `room` would then bring the slot back
+    /// at a frame the later state had already moved past.)
+    fn reschedule(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
+        if reschedule_holds() && self.held.get(&index) == Some(&write) {
+            self.held.remove(&index);
+        }
+        self.same(index, write)
+    }
+
     /// Slot `index` is up to date: out of the queue until written again.
     fn done(&mut self, index: u32, write: u64) {
         if self.same(index, write).is_some() {
@@ -970,7 +1016,7 @@ impl TextureQueue {
     /// Nothing to upload at slot `index` now: looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
     fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
         }
@@ -1010,7 +1056,7 @@ impl TextureQueue {
     /// Slot `index` was uploaded with `mapped` bytes of its memory there,
     /// not all of it: looked at again from frame `due`.
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
         }
     }
@@ -1021,7 +1067,7 @@ impl TextureQueue {
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
     fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
         }
@@ -3080,12 +3126,17 @@ impl HostHeap {
                 note_before(index, shown, if later { "null, waits" } else { "at once" });
             }
             self.quick_is(index, 0);
-            self.made.set(index, if later { 0 } else { key });
             let kept = if later {
                 None
             } else {
                 make_twinned(&view, self.at(index), self.twin(index))
             };
+            // A slot a temporary refusal left null is left eligible: the
+            // next mirror of it tries again instead of finding it made
+            // (`VICTORY_TEXTURE_RESCHEDULE=1`).
+            let retry = retry_slots() && kept.is_none() && !later && refused_now(&view);
+            let shown = if later || retry { 0 } else { key };
+            self.made.set(index, shown);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.at(index));
             }
@@ -3094,7 +3145,7 @@ impl HostHeap {
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
             self.keep(index, kept.flatten());
-            self.quick_is(index, if later { 0 } else { key });
+            self.quick_is(index, shown);
             drop(held);
             self.unmake_stale(index, stale);
         }
@@ -5138,6 +5189,42 @@ mod tests {
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
     }
 
+
+    /// A slot given work of its own stops waiting for card space: `room`
+    /// does not bring it back at the frame its hold was taken for, which
+    /// that work has moved past.
+    #[test]
+    fn a_rescheduled_slot_is_no_longer_held_for_card_space() {
+        if !reschedule_holds() {
+            return; // the switch is off in this run
+        }
+        let mut q = TextureQueue::default();
+        q.written(1, 0, 0, false);
+        let (slot, write) = q.due(0, 4)[0];
+        // Held back for a full card until frame 10.
+        q.hold(slot, write, 10);
+        assert_eq!(q.room(5), 1, "held for card space");
+        // Then given a recheck of its own at frame 20: it is not waiting
+        // for space any more.
+        q.hold(slot, write, 10);
+        q.recheck(slot, write, 20, (16, 8), 1, 0, 4);
+        assert_eq!(q.room(6), 0, "not waiting for card space");
+        assert!(q.due(19, 4).is_empty(), "not before its own frame");
+        assert_eq!(q.due(20, 4).len(), 1, "due at the frame the pass set");
+    }
+
+    /// A hold on a write that is gone is not brought back by `room`.
+    #[test]
+    fn a_held_slot_written_again_is_not_brought_back() {
+        let mut q = TextureQueue::default();
+        q.written(1, 0, 0, false);
+        let (slot, write) = q.due(0, 4)[0];
+        q.hold(slot, write, 10);
+        // The title writes it again: a new write, and the hold was for the
+        // old one. (A draw making the slot, seen, keeps the write.)
+        q.written(slot, 0, 0, false);
+        assert_eq!(q.room(5), 0, "the hold was for another write");
+    }
     /// Slots held back for lack of room on the card are not handed out
     /// until their frame, keep their place, are not counted as waiting
     /// for their memory, and all come back at once when the card has room;
