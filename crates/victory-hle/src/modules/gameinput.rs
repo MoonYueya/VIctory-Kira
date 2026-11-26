@@ -1179,16 +1179,58 @@ mod host {
         empty_until: [Option<Instant>; PADS],
     }
 
+    /// The scripted keys as readings (see `stand_in`); `None` when no script is
+    /// asked for, and in builds without diagnostics.
+    fn scripted_keys() -> Option<Vec<KeyState>> {
+        #[cfg(feature = "diagnostics")]
+        {
+            scripted_asked().then(|| {
+                scripted()
+                    .into_iter()
+                    .map(|virtual_key| KeyState { virtual_key, ..Default::default() })
+                    .collect()
+            })
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            None
+        }
+    }
+
+    /// What slot `slot` shows while the host has no pad in it: with scripted
+    /// keys asked for (`VICTORY_KEYS`), slot 0 shows a stand-in pad that is
+    /// **there the whole time** and carries them, by the stand-in device's own
+    /// table (`super::fallback`: buttons, sticks and triggers alike), so that a
+    /// screen reading slot 0 alone (the title's start screen) sees what the
+    /// keyboard does. A pad that appeared only while a key was held came and
+    /// went, which the title read as an unplugged pad (the controller-
+    /// disconnected screen); with no key held the stand-in is there, at rest.
+    /// Every other slot stays empty, and slot 0 stays empty without a script.
+    fn stand_in(slot: usize, keys: Option<&[KeyState]>) -> Option<PadState> {
+        let keys = keys.filter(|_| slot == 0)?;
+        Some(super::fallback(keys))
+    }
+
+    /// Whether scripted keys are asked for at all (`VICTORY_KEYS` names one),
+    /// whether or not one is held now: the stand-in outlives the keys it presses.
+    #[cfg(feature = "diagnostics")]
+    fn scripted_asked() -> bool {
+        static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ASKED.get_or_init(|| std::env::var("VICTORY_KEYS").is_ok_and(|v| !v.trim().is_empty()))
+    }
+
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            // No host pad in this slot: slot 0 still shows the scripted keys as a
+            // stand-in pad that never comes or goes (see `stand_in`).
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
+                return stand_in(slot, scripted_keys().as_deref());
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
+                return stand_in(slot, scripted_keys().as_deref());
             }
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
@@ -1317,6 +1359,34 @@ mod host {
             ),
             (1.0, -1.0, 1.0, 0.0)
         );
+    }
+
+    /// Slot 0's stand-in outlives the keys it presses: it is there with none held
+    /// (at rest), it is gone when no script is asked for, and no other slot has
+    /// one - a slot that came and went read as a pad unplugged.
+    #[test]
+    fn slot_zero_shows_a_stand_in_pad_for_as_long_as_a_script_is_asked_for() {
+        let held = [KeyState { virtual_key: b'W', ..Default::default() }];
+        let (at_rest, moving) = (stand_in(0, Some(&[])), stand_in(0, Some(&held)));
+        assert_eq!(at_rest, Some(PadState::default()), "there with no key held");
+        assert_eq!(moving.map(|p| p.left_y), Some(1.0), "W pushes the stick up");
+        assert_eq!(stand_in(0, None), None, "no script, no stand-in");
+        for slot in 1..PADS {
+            assert_eq!(stand_in(slot, Some(&held)), None, "slot {slot} stays empty");
+        }
+    }
+
+    /// The stand-in presses what the stand-in device's table says: a button, and
+    /// the sticks and triggers the fallback reads from the same table.
+    #[test]
+    fn the_stand_in_pad_presses_by_the_stand_in_devices_table() {
+        let keys = [b'X', b'Z', b'L', 0x0D]
+            .into_iter()
+            .map(|virtual_key| KeyState { virtual_key, ..Default::default() })
+            .collect::<Vec<_>>();
+        let pad = stand_in(0, Some(&keys)).expect("a stand-in pad");
+        assert_eq!(pad.buttons, X | A, "X and Enter (the table's A)");
+        assert_eq!((pad.left_trigger, pad.right_x), (1.0, 1.0), "Z and L");
     }
 }
 
