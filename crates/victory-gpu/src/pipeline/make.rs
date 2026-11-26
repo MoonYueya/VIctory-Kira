@@ -120,7 +120,15 @@ pub(crate) fn hashes(p: &Pending) -> String {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
+/// Waiting allowed per title frame, over all threads
+/// (`VICTORY_PIPELINE_WAIT_MS`, 500).
+///
+/// Lowering it trades a frame's stall for missing draws: a draw or dispatch
+/// whose pipeline is not made within the budget is dropped for that frame,
+/// as an untranslated one is, so a world that streams in what it has not
+/// compiled yet briefly loses objects while the driver compiles in the
+/// background; a cold pipeline no longer holds the title for half a second
+/// a frame. 0 waits for nothing at all.
 fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
@@ -129,6 +137,22 @@ fn wait_budget() -> Duration {
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(500);
         tracing::info!(millis, "host pipeline wait budget per frame");
+        Duration::from_millis(millis)
+    })
+}
+
+/// Waiting allowed per title frame for the pipelines of a pass the title
+/// runs once, its decoration bake (`crate::draw::BAKE_PIXEL_SHADERS`;
+/// `VICTORY_PIPELINE_WAIT_ONCE_MS`, 500): those draws come once and are
+/// never asked for again, so a budget meant for a streaming world would
+/// lose them for good. The larger of this and [`wait_budget`] is used.
+fn once_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let millis = std::env::var("VICTORY_PIPELINE_WAIT_ONCE_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(500);
         Duration::from_millis(millis)
     })
 }
@@ -200,10 +224,22 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Whether `p` is a pipeline of a pass the title runs once, its
+/// decoration bake (`crate::draw::BAKE_PIXEL_SHADERS`).
+fn runs_once(p: &Pending) -> bool {
+    p.shaders.iter().any(|s| crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str()))
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
-    let budget = if screen { screen_budget() } else { wait_budget() };
+    let budget = if screen {
+        screen_budget()
+    } else if runs_once(p) {
+        once_budget().max(wait_budget())
+    } else {
+        wait_budget()
+    };
     if budget.is_zero() {
         return;
     }
@@ -480,6 +516,25 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pipeline of the decoration bake is one the title runs once, and
+    /// gets the `VICTORY_PIPELINE_WAIT_ONCE_MS` budget; any other gets the
+    /// frame's (`VICTORY_PIPELINE_WAIT_MS`, 500 ms by default, unchanged).
+    #[test]
+    fn a_bake_pipeline_is_waited_for_once() {
+        // A shader made from the hash alone: nothing is translated, and
+        // `wait` is all this test looks at.
+        let hash = crate::draw::BAKE_PIXEL_SHADERS[0];
+        let bake = Pending::new(vec![Arc::new(Shader::test(hash))], None);
+        let other = Pending::new(vec![Arc::new(Shader::test("0000000000000000"))], None);
+        assert!(runs_once(&bake));
+        assert!(!runs_once(&other));
+        // The defaults are the ones this fork had: half a second a frame,
+        // and the same for a bake unless asked otherwise.
+        let asked = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        assert_eq!(wait_budget(), Duration::from_millis(asked("VICTORY_PIPELINE_WAIT_MS").unwrap_or(500)));
+        assert_eq!(once_budget(), Duration::from_millis(asked("VICTORY_PIPELINE_WAIT_ONCE_MS").unwrap_or(500)));
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {

@@ -68,6 +68,22 @@ pub(crate) struct Shader {
     translated: OnceLock<Option<Translated>>,
 }
 
+#[cfg(test)]
+impl Shader {
+    /// A shader of a test: a hash alone, nothing to translate.
+    pub(crate) fn test(hash: &str) -> Shader {
+        Shader {
+            stage: "pixel",
+            hash: hash.to_owned(),
+            container: Vec::new(),
+            #[cfg(windows)]
+            ambient: None,
+            #[cfg(windows)]
+            translated: OnceLock::new(),
+        }
+    }
+}
+
 impl std::fmt::Debug for Shader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.stage, self.hash)
