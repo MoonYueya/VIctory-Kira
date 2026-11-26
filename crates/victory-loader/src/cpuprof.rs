@@ -42,10 +42,14 @@ use crate::stacks::{frames_of, name_of, other_threads, start_of};
 /// are what is measured in full, and this only says where that time went.
 ///
 /// Two threads, not six: a run of this layer has hundreds of threads, and every
-/// suspension of a busy one is time the title did not get. Measured on the
-/// world section: six threads cost about 16% of a frame (652 ms without the
-/// profiler, 757 ms with it), which is a measurement that changes what it
-/// measures. The processor times cost nothing and are still taken for all.
+/// suspension of a busy one is time the title did not get. The processor times
+/// cost nothing and are still taken for every thread; this only says where
+/// that time went.
+///
+/// An earlier note here claimed six cost 16% of a frame. Two runs of the same
+/// world then differed by half, and the cause was the pipeline library, not
+/// the sampler: the cold run compiled 773 host pipelines in its world section
+/// and the warm one 44. The claim is withdrawn -- see the report.
 const SAMPLE: usize = 2;
 
 /// Names for addresses in our own program, from the symbols beside it.
