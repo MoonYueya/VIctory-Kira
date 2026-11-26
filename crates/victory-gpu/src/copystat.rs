@@ -131,6 +131,12 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Indirect commands that read a record gathered into their list's
+    /// prelude (VICTORY_INDIRECT_GATHER=1: no pass of ours in front of the
+    /// draw), and those that asked for one and got none (the list had
+    /// stopped gathering, its sets were full, or the record did not fit).
+    IndirectGathered,
+    IndirectGatherMissed,
 }
 const COUNTERS: usize = 80;
 /// One of some sets of counters, each in lines of the processor's memory of
@@ -1440,10 +1446,13 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         such waits each); {:.0} read a record gathered into their list's prelude (VICTORY_INDIRECT_GATHER=1, \
+         no pass of ours), {:.0} asked for one and got none; barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
+        c[C::IndirectGathered as usize],
+        c[C::IndirectGatherMissed as usize],
         barrier_test()
     );
     // What is compared after submissions, largest first, and how much of

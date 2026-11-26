@@ -104,6 +104,12 @@ Changes of this branch:
   - `VICTORY_DROP_HOST_COPY=1`: let a texture's host copy go once its upload ran.
   - `VICTORY_WINDOW_BUDGET_MB`: how much of the title's window copies to keep under system
     memory pressure (#77; it behaves as a floor, see findings).
+  - `VICTORY_INDIRECT_GATHER=1`: a single indirect record that misses its window is
+    clamped in the list's prelude with the list's other such records, instead of by a pass
+    of ours in front of its draw (fxceless/victory-fork `465b94f5`; only for records no
+    batch of `VICTORY_INDIRECT_BATCH` took, so it serves nothing while batches are on).
+  - `VICTORY_MAP_RUNS=0`: the title's page mappings go page by page again, as before
+    (Fayberr/Victory-United `4180818`; runs of pages are the default here).
   - `-SeriesS` in `play.ps1`.
 
 Measured on the RTX 3080 and **not** taken, with the numbers, in
