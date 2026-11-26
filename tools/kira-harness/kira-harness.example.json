@@ -1,0 +1,36 @@
+{
+  "victory": "~/../../target/diag/victory.exe",
+  "exe": "PATH/TO/THE/TITLE/TITLE.exe",
+  "exeSha256": null,
+  "gameDir": "PATH/TO/THE/TITLE",
+  "work": "PATH/TO/A/SCRATCH/FOLDER/kira-harness",
+  "dataTemplate": null,
+  "seconds": 600,
+  "keys": [
+    {
+      "at": 20,
+      "keys": [
+        "Enter"
+      ]
+    },
+    {
+      "at": 40,
+      "keys": [
+        "Enter"
+      ]
+    },
+    {
+      "at": 60,
+      "keys": [
+        "Enter"
+      ]
+    },
+    {
+      "at": 90,
+      "keys": [
+        "Enter"
+      ]
+    }
+  ],
+  "stopOnWorld": true
+}
