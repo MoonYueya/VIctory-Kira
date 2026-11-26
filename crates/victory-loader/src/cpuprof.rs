@@ -40,7 +40,13 @@ use crate::stacks::{frames_of, name_of, other_threads, start_of};
 /// How many of the busiest threads are sampled for a stack each round. A
 /// sample suspends the thread, so this stays small: the processor times above
 /// are what is measured in full, and this only says where that time went.
-const SAMPLE: usize = 6;
+///
+/// Two threads, not six: a run of this layer has hundreds of threads, and every
+/// suspension of a busy one is time the title did not get. Measured on the
+/// world section: six threads cost about 16% of a frame (652 ms without the
+/// profiler, 757 ms with it), which is a measurement that changes what it
+/// measures. The processor times cost nothing and are still taken for all.
+const SAMPLE: usize = 2;
 
 /// Names for addresses in our own program, from the symbols beside it.
 ///
@@ -91,9 +97,14 @@ impl Symbols {
                 c"SymGetLineFromAddr64".as_ptr().cast(),
             )?);
             let process = GetCurrentProcess();
-            // Undecorated names, loaded when asked for, no dialogs
-            // (SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS).
-            options(0x2 | 0x4 | 0x100);
+            // The same three the timeline writes its names with
+            // (`timeline/report.rs`): SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS |
+            // SYMOPT_FAIL_CRITICAL_ERRORS. In particular NOT
+            // SYMOPT_NO_UNQUALIFIED_LOADS (0x100): with it DbgHelp will not
+            // take the symbols of a module it has not been handed by name,
+            // and every address here comes back unnamed -- which is what the
+            // first run of this profiler wrote.
+            options(0x2 | 0x4 | 0x200);
             // The symbols lie beside the program, which names them by their
             // file alone.
             let beside = std::env::current_exe()
@@ -125,7 +136,10 @@ impl Symbols {
         let function = unsafe {
             at.cast::<u32>().write(88);
             at.add(80).cast::<u32>().write(ROOM as u32);
-            if (self.from_address)(self.process, address as u64, &mut off, at) == 0 {
+            // One byte back: an address on the instruction after a call still
+            // names the function it is in, where the first byte of the next
+            // one would be given instead.
+            if (self.from_address)(self.process, address as u64 - 1, &mut off, at) == 0 {
                 return None;
             }
             std::ffi::CStr::from_ptr(at.add(NAME).cast())
@@ -376,6 +390,15 @@ fn cpuprof(
     phase: fn() -> u32,
 ) {
     std::thread::sleep(from.saturating_sub(start.elapsed()));
+    // The walk is the lightest thread in the process: it must never take a
+    // processor the title could have used.
+    // SAFETY: a plain call on our own thread.
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST,
+        };
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    }
     eprintln!("VIctory: the CPU profile begins");
     let begin = Instant::now();
     let mut seen: HashMap<u32, Seen> = HashMap::new();
