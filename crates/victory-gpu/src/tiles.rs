@@ -138,9 +138,41 @@ struct Heap {
 unsafe impl Send for Heap {}
 
 impl Heap {
+    /// A heap of the pool, if tiles may be mapped into it: only one of the
+    /// card's own memory (`D3D12_HEAP_TYPE_DEFAULT`) is.
+    ///
+    /// A heap opened over the title's own memory (`crate::inplace`: a custom
+    /// L0 heap in the PC's memory, shared and cross-adapter shared) has no
+    /// tiles: `UpdateTileMappings` that names one is refused and REMOVES THE
+    /// DEVICE (`inplace.rs`, the probe's rule: "Tile mappings into such a
+    /// heap are refused and REMOVE THE DEVICE: never call them"). No heap of
+    /// the pool is one — [`take`] makes its own — and this check is what
+    /// keeps it so if ever a heap from elsewhere is offered here. Asked once,
+    /// before the pool can hand out any tile of it.
+    fn admit(heap: ID3D12Heap) -> Option<Self> {
+        // SAFETY: the caller holds a live heap.
+        let desc = unsafe { heap.GetDesc() };
+        if !tiles_into(desc.Properties.Type) {
+            tracing::warn!(
+                kind = desc.Properties.Type.0,
+                "a heap that is not of the card's memory cannot give texture levels tiles: no tile mapping is sent into it, which would remove the device"
+            );
+            return None;
+        }
+        Some(Self {
+            heap,
+            free: vec![(0, HEAP_TILES)],
+        })
+    }
+
     fn free_tiles(&self) -> u32 {
         self.free.iter().map(|run| run.1).sum()
     }
+}
+
+/// Whether tiles may be mapped into a heap of this kind ([`Heap::admit`]).
+fn tiles_into(kind: D3D12_HEAP_TYPE) -> bool {
+    kind == D3D12_HEAP_TYPE_DEFAULT
 }
 
 /// The pool's heaps by place; a place is empty after its heap went back to
@@ -175,10 +207,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
                 tracing::warn!(error = %e, "no heap for texture levels given on demand: those levels stay empty");
                 return None;
             }
-            let fresh = Heap {
-                heap: made?,
-                free: vec![(0, HEAP_TILES)],
-            };
+            let fresh = Heap::admit(made?)?;
             STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
             match pool.iter().position(Option::is_none) {
                 Some(index) => {
@@ -1469,6 +1498,39 @@ void look() {
             s[3] >> 20,
             s[8]
         );
+    }
+
+    /// A heap that is not the card's own memory gives no tiles: a tile
+    /// mapping that names one removes the device (`inplace.rs`, the probe's
+    /// rule). The pool's own heaps are of the card's memory and are taken;
+    /// an upload heap is of the PC's and is turned down (`tiles_into`).
+    #[test]
+    fn a_heap_of_the_pcs_memory_gives_no_tiles() {
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        let heap = |kind: D3D12_HEAP_TYPE| {
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: 4 * TILE,
+                Properties: D3D12_HEAP_PROPERTIES {
+                    Type: kind,
+                    ..Default::default()
+                },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+            };
+            let mut made: Option<ID3D12Heap> = None;
+            // SAFETY: plain creation; the out pointer is ours.
+            unsafe { device.CreateHeap::<ID3D12Heap>(&raw const desc, &raw mut made) }.map(|()| made.unwrap()).ok()
+        };
+        let Some(upload) = heap(D3D12_HEAP_TYPE_UPLOAD) else { return };
+        // The card's own kind is what the pool makes, and what passes.
+        assert!(tiles_into(D3D12_HEAP_TYPE_DEFAULT));
+        assert!(!tiles_into(D3D12_HEAP_TYPE_UPLOAD));
+        assert!(!tiles_into(D3D12_HEAP_TYPE_READBACK));
+        assert!(Heap::admit(upload).is_none(), "the PC's memory gives no tiles");
+        let Some(by_default) = heap(D3D12_HEAP_TYPE_DEFAULT) else { return };
+        let admitted = Heap::admit(by_default).expect("the card's memory gives tiles");
+        assert_eq!(admitted.free_tiles(), HEAP_TILES, "a fresh heap's every tile is free");
     }
 
     #[test]
