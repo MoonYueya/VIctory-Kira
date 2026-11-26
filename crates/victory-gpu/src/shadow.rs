@@ -2907,9 +2907,24 @@ pub(crate) fn let_go_idle() {
                 .collect();
             window_victims(&entries, keep)
         };
-        victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
+        // Counted before they leave, with the table's lock held, and each
+        // looked at AGAIN after the count ([`TABLES_CHANGED`]): a thread
+        // that took one from its own memory of asks before the count moved
+        // holds it by now, and it stays.
+        let victims: Vec<(u64, u64)> = victims.into_iter().map(|i| eligible[i].1).collect();
+        if !victims.is_empty() {
+            tables_changed();
+        }
+        let mut gone = Vec::new();
+        for key in victims {
+            if map.get(&key).is_some_and(|s| std::sync::Arc::strong_count(s) == 1) {
+                gone.extend(map.remove(&key));
+            }
+        }
+        gone
     };
     if !gone.is_empty() {
+        tables_changed();
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
         crate::host::trail(|| {
             format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
@@ -4839,63 +4854,7 @@ struct Entry {
 static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
 fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
-    // What threads remember of it ([`FOUND`]) is of before.
-    BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
-    map
-}
-
-/// How often [`BUFFERS`] was taken to be changed.
-static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
-
-/// Answers a thread remembers.
-const FOUND_MOST: usize = 1024;
-
-/// An ask (address, bytes), the count of changes it was answered at, and the
-/// answer.
-type Found = (u64, u64, u64, std::sync::Weak<Shadow>);
-
-thread_local! {
-    /// The last answers of [`lookup`] out of [`BUFFERS`], by a hash of the
-    /// ask: the same buffers are asked about draw after draw, from five
-    /// threads, each time through the map's lock and a dozen of its nodes
-    /// (7 % of the recording threads' time, profile waits-1).
-    static FOUND: std::cell::RefCell<Vec<Found>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Whether [`FOUND`] is kept (`VICTORY_QUICK_FIND=0`: not).
-fn quick_find() -> bool {
-    crate::toggled!("VICTORY_QUICK_FIND")
-}
-
-fn found_at(address: u64, len: u64) -> usize {
-    let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (h >> 54) as usize % FOUND_MOST
-}
-
-/// What this thread remembers of an ask, if nothing changed since.
-fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
-    let shadow = FOUND.with(|f| {
-        let f = f.borrow();
-        let (a, n, at, shadow) = f.get(found_at(address, len))?;
-        ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
-    })?;
-    // Whoever takes the map to let a copy go that nobody holds finds it held
-    // now, or had counted before: then it is not handed out.
-    std::sync::atomic::fence(Ordering::SeqCst);
-    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
-}
-
-/// Remembers an answer given while `changed` was the count.
-fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
-    FOUND.with(|f| {
-        let mut f = f.borrow_mut();
-        if f.is_empty() {
-            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
-        }
-        f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
-    });
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
@@ -4904,18 +4863,25 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    // After the insert, with the table's lock still held: a thread that asked
+    // between the two would otherwise keep the old table's answer under the
+    // new count for good (fxceless/victory-gta6, pull request #1245).
+    tables_changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let mut map = buffers();
+    tables_changed();
+    map.remove(&(start, resource));
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -4944,18 +4910,32 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
+        // Counted before they leave, with the table's lock held: a thread
+        // that took one from its own memory of asks before the count moved
+        // holds it by now, and the count it read is the old one
+        // ([`TABLES_CHANGED`]).
+        if !keys.is_empty() {
+            tables_changed();
+        }
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
-                gone.extend(entry.shadow.take());
+        let placed = |entry: &Entry| entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some());
+        if map.range(..(end, 0)).rev().take(256).any(|(_, entry)| placed(entry)) {
+            tables_changed();
+            for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
+                if placed(entry) {
+                    gone.extend(entry.shadow.take());
+                }
             }
         }
     }
     let n = gone.len() as u64;
+    if n > 0 {
+        tables_changed();
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }
@@ -5004,29 +4984,282 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, true)
 }
 
+/// Counts the changes of the tables [`lookup`] reads that can change what an
+/// ask finds: a buffer registered or released, a copy taken out of a table,
+/// a window made. A thread's remembered answers ([`FOUND`]) are from one
+/// count.
+static TABLES_CHANGED: AtomicU64 = AtomicU64::new(0);
+
+fn tables_changed() {
+    TABLES_CHANGED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Since the last frame line: asks answered from a thread's own memory of
+/// them, and asks that went to the tables.
+pub(crate) static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether a thread remembers what its asks found (fork pull request
+/// #1237; `VICTORY_LOOKUP_CACHE=1`).
+///
+/// Every bind of a draw asks for the host copy of each buffer it reads:
+/// under the tables' one lock, among the 64 buffers that start below the
+/// address, then, for memory outside buffers, under the windows' lock. The
+/// title's six recording threads spent 54 ms a frame there together in the
+/// prologue cell (`VICTORY_PROFILE`), and asked for the same ranges again
+/// and again. A thread now keeps what each ask (address, length, kind)
+/// found, weakly (a copy nothing else holds can still be let go), for as
+/// long as the tables have not changed ([`TABLES_CHANGED`]).
+///
+/// Here: OFF unless `VICTORY_LOOKUP_CACHE=1` until a run of ours has carried
+/// it (the pull request has it on by default); `alt`: twenty seconds with,
+/// twenty without, in turn, each change said in the log.
+fn lookup_cache() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_LOOKUP_CACHE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a thread remembers what its asks for a buffer's host copy found from now (VICTORY_LOOKUP_CACHE=alt): {}",
+                    if on { "ON" } else { "off, every ask goes to the tables as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The most asks a thread remembers before it starts again.
+const FOUND_MOST: usize = 8192;
+
+type Found = std::collections::HashMap<(u64, u64, bool), std::sync::Weak<Shadow>>;
+
+thread_local! {
+    /// What this thread's asks found, and the count of table changes they
+    /// are from.
+    static FOUND: std::cell::RefCell<(u64, Found)> = std::cell::RefCell::new((u64::MAX, Found::new()));
+}
+
+fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    if !lookup_cache() {
+        // Counted the same way with the cache off, so that the frame line says
+        // how many asks there are either way.
+        LOOKUPS[1].fetch_add(1, Ordering::Relaxed);
+        return lookup_tables(address, len, any);
+    }
+    let changes = TABLES_CHANGED.load(Ordering::SeqCst);
+    let found = FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        if f.0 != changes {
+            f.1.clear();
+            f.0 = changes;
+        }
+        f.1.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)
+    });
+    // (The count again: a copy the sweep or `in_place_let_go` takes out of
+    // its table at this moment can still be alive for the weak handle, and
+    // what it held is no longer what the tables say.)
+    if let Some(shadow) = found.filter(|_| TABLES_CHANGED.load(Ordering::SeqCst) == changes) {
+        LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
+        if shadow.window {
+            // As `loose` notes an ask of a window it hands out.
+            let now = crate::host::moment();
+            if shadow.used.load(Ordering::Relaxed) != now {
+                shadow.used.store(now, Ordering::Relaxed);
+            }
+            if shadow.asked[0].load(Ordering::Relaxed) > address {
+                shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+            }
+            let end = address.saturating_add(len.max(1));
+            if shadow.asked[1].load(Ordering::Relaxed) < end {
+                shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+            }
+            if len <= 1 {
+                shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        return Some(shadow);
+    }
+    LOOKUPS[1].fetch_add(1, Ordering::Relaxed);
+    let shadow = lookup_tables(address, len, any)?;
+    FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        // (from the count read before the tables were: a change since
+        // clears it at the next ask)
+        if f.0 == changes {
+            if f.1.len() >= FOUND_MOST {
+                f.1.clear();
+            }
+            f.1.insert((address, len, any), Arc::downgrade(&shadow));
+        }
+    });
+    Some(shadow)
+}
+
+/// For the frame line: the asks answered from a thread's own memory of them,
+/// and those that went to the tables, per frame since the last line.
+pub(crate) fn lookup_line(frames: f64) {
+    if !(frames > 0.0) {
+        return;
+    }
+    let found = [0, 1].map(|i| LOOKUPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if found[0] + found[1] <= 0.0 {
+        return;
+    }
+    tracing::info!(
+        "asks for a buffer's host copy per frame: {:.0} answered from the asking thread's memory of them, {:.0} from the tables          ({:.0} % remembered; VICTORY_LOOKUP_CACHE=1: {})",
+        found[0],
+        found[1],
+        (found[0] * 100.0 / (found[0] + found[1])).round(),
+        if lookup_cache() { "on" } else { "off" }
+    );
+}
+
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::{FOUND, Found, LOOKUPS, TABLES_CHANGED, find, lookup_cache, register, tables_changed, unregister};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    /// What this thread's memory of an ask holds right now, if it is the
+    /// answer an ask at `at` (`len` bytes) would get.
+    fn remembered(at: u64, len: u64) -> Option<Arc<super::Shadow>> {
+        FOUND.with(|f| {
+            let f = &mut *f.borrow_mut();
+            let now = TABLES_CHANGED.load(Ordering::SeqCst);
+            if f.0 != now {
+                f.1.clear();
+                f.0 = now;
+            }
+            f.1.get(&(at, len, false)).and_then(std::sync::Weak::upgrade)
+        })
+    }
+
+    fn remembered_any(at: u64, len: u64) -> Option<Arc<super::Shadow>> {
+        FOUND.with(|f| {
+            let f = &mut *f.borrow_mut();
+            let now = TABLES_CHANGED.load(Ordering::SeqCst);
+            if f.0 != now {
+                f.1.clear();
+                f.0 = now;
+            }
+            f.1.get(&(at, len, true)).and_then(std::sync::Weak::upgrade)
+        })
+    }
+
+    fn note(at: u64, len: u64, any: bool, shadow: &Arc<super::Shadow>, at_count: u64) {
+        FOUND.with(|f| {
+            let f = &mut *f.borrow_mut();
+            f.0 = at_count;
+            f.1.insert((at, len, any), Arc::downgrade(shadow));
+        });
+    }
+
+    /// The switch reads `VICTORY_LOOKUP_CACHE` once: unset or `0` keeps the
+    /// cache off, as this branch ships it.
+    #[test]
+    fn the_cache_is_off_unless_asked_for() {
+        // (The switch is read once per process, so only the shipped default
+        // can be stated: with the variable unset or `0`, no ask is kept.)
+        if std::env::var_os("VICTORY_LOOKUP_CACHE").is_none_or(|v| v == "0") {
+            assert!(!lookup_cache(), "unset or `0`: every ask goes to the tables");
+        }
+    }
+
+    /// A buffer registered after a thread remembered an answer at its
+    /// address: the remembered answer is not what the tables say any more,
+    /// and an ask at it is not answered from the thread's memory.
+    #[test]
+    fn a_registered_buffer_invalidates_what_a_thread_remembers() {
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let resource = start as usize;
+        let shadow = super::Shadow::unbacked(start, std::ptr::null_mut(), 64, false);
+        let before = TABLES_CHANGED.load(Ordering::SeqCst);
+        note(start, 64, false, &shadow, before);
+        assert_eq!(remembered(start, 64).map(|s| s.start), Some(start));
+        register(resource, start, 64);
+        let after = TABLES_CHANGED.load(Ordering::SeqCst);
+        assert_ne!(after, before, "a registration counts");
+        assert!(remembered(start, 64).is_none(), "the remembered answer is of the old tables");
+        unregister(resource, start);
+        assert_ne!(TABLES_CHANGED.load(Ordering::SeqCst), after, "a release counts too");
+    }
+
+    /// A copy let go counts before it leaves: a thread that remembered it
+    /// does not hand it out after the change.
+    #[test]
+    fn a_copy_that_leaves_the_tables_is_not_remembered() {
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let resource = start as usize;
+        let shadow = super::Shadow::unbacked(start, std::ptr::null_mut(), 64, false);
+        let at = TABLES_CHANGED.load(Ordering::SeqCst);
+        note(start, 64, false, &shadow, at);
+        register(resource, start, 64);
+        let counted = TABLES_CHANGED.load(Ordering::SeqCst);
+        unregister(resource, start);
+        assert_ne!(TABLES_CHANGED.load(Ordering::SeqCst), counted);
+        drop(shadow);
+        assert!(remembered(start, 64).is_none());
+    }
+
+    /// A window is asked for by a buffered ask and by a draw's ask
+    /// (`find_any`): the two are different asks and do not share an answer.
+    #[test]
+    fn the_two_kinds_of_ask_are_kept_apart() {
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let shadow = super::Shadow::unbacked(start, std::ptr::null_mut(), 4096, true);
+        let at = TABLES_CHANGED.load(Ordering::SeqCst);
+        note(start, 16, true, &shadow, at);
+        assert!(remembered(start, 16).is_none(), "a draw's ask is not the slot's ask");
+        assert_eq!(remembered_any(start, 16).map(|s| s.len), Some(4096));
+    }
+
+    /// The counters the frame line prints move: an ask answered from a
+    /// thread's memory counts there, one that goes to the tables counts
+    /// there.
+    #[test]
+    fn the_counters_say_where_an_ask_was_answered() {
+        let hit = LOOKUPS[0].load(Ordering::Relaxed);
+        let miss = LOOKUPS[1].load(Ordering::Relaxed);
+        // (No card here: `find` of memory no buffer holds goes to `loose`,
+        // which needs the host. The counters themselves are what is tested.)
+        LOOKUPS[0].fetch_add(3, Ordering::Relaxed);
+        LOOKUPS[1].fetch_add(2, Ordering::Relaxed);
+        assert!(LOOKUPS[0].load(Ordering::Relaxed) >= hit + 3);
+        assert!(LOOKUPS[1].load(Ordering::Relaxed) >= miss + 2);
+        LOOKUPS[0].fetch_sub(3, Ordering::Relaxed);
+        LOOKUPS[1].fetch_sub(2, Ordering::Relaxed);
+        let _ = find;
+        let _: Option<Found> = None;
+        let _ = tables_changed as fn();
+    }
+}
 /// The copy [`find`] gives for a range inside a title buffer, if it was made.
 pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
 }
 
-fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
-    let quick = quick_find();
-    if quick && let Some(shadow) = found(address, len) {
-        return Some(shadow);
-    }
+fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     {
         let map = buffers_read();
         match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
             // The copy is made already (nearly always).
-            Some((_, Entry { shadow: Some(shadow), .. })) => {
-                if quick {
-                    // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
-                }
-                return Some(shadow.clone());
-            }
+            Some((_, Entry { shadow: Some(shadow), .. })) => return Some(shadow.clone()),
             Some(_) => {}
             None => {
                 drop(map);
@@ -5058,6 +5291,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let big = cards() && (size >= card_limits().0 || card_all());
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            // After the entry is in, with the table's lock held
+            // ([`TABLES_CHANGED`]).
+            tables_changed();
             return entry.shadow.clone();
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
@@ -5106,6 +5342,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
         }
         entry.shadow = Some(shadow);
+        // After the entry is in, with the table's lock held
+        // ([`TABLES_CHANGED`]).
+        tables_changed();
     }
     entry.shadow.clone()
 }
@@ -5367,6 +5606,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        // After the window is in the table, with its lock held
+        // ([`TABLES_CHANGED`]).
+        tables_changed();
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
@@ -5380,6 +5622,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        tables_changed();
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -5417,6 +5660,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    tables_changed();
     Some(shadow)
 }
 

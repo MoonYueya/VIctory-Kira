@@ -3845,6 +3845,7 @@ fn late_line(frames: f64) {
             t[3],
         );
     }
+    crate::shadow::lookup_line(frames);
     card_steps::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
