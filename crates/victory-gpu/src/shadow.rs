@@ -2814,6 +2814,46 @@ fn window_budget() -> Option<u64> {
     })
 }
 
+/// Whether the budget of [`window_budget`] applies in every band, Calm
+/// included (`VICTORY_WINDOW_BUDGET_ALWAYS=1`). Off unless the value is
+/// exactly `1`: unset, empty, `0` and anything else keep PR #77's band gate,
+/// so a run without the variable is the run it was.
+fn always_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+fn window_budget_always() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| always_from(std::env::var_os("VICTORY_WINDOW_BUDGET_ALWAYS").as_deref()))
+}
+
+/// What one sweep of [`let_go_idle`] keeps: the idle timeout the band allows,
+/// and the bytes of copies to leave alive (`u64::MAX`: everything eligible
+/// goes, which is the sweep with no budget at all).
+///
+/// With `always` the cap is the operator's number in every band: `budget`
+/// stays `budget` where PR #77 would halve it, and the band no longer
+/// shortens the idle time either. Shortening the idle time is the half of
+/// PR #77's policy that makes a copy go that the renderer asks for again,
+/// and it is the half that does not need to move for the byte cap to be
+/// measured; so with the switch on, only the byte side is in force and it
+/// is in force everywhere.
+fn window_keep(
+    band: crate::host::RamBand,
+    budget: u64,
+    always: bool,
+    idle_ms: u64,
+) -> (u64, u64) {
+    if always {
+        return (idle_ms, budget);
+    }
+    match band {
+        crate::host::RamBand::Calm => (idle_ms, u64::MAX),
+        crate::host::RamBand::Watch => (idle_ms.min(10_000), budget),
+        crate::host::RamBand::High => (idle_ms.min(2_000), budget / 2),
+    }
+}
+
 /// Oldest eligible copies to remove until their unique bytes fit `keep`.
 /// Entries are `(last-used moment, bytes, unique copy identity)`, already
 /// sorted oldest first; one copy standing under several keys counts once.
@@ -2866,17 +2906,7 @@ pub(crate) fn let_go_idle() {
         if let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample() {
             let mut band = WINDOW_BAND.lock().unwrap_or_else(|e| e.into_inner());
             *band = crate::host::ram_band(*band, working, private, free, commit, total, limit);
-            match *band {
-                crate::host::RamBand::Calm => {}
-                crate::host::RamBand::Watch => {
-                    idle_ms = idle_ms.min(10_000);
-                    keep = bytes;
-                }
-                crate::host::RamBand::High => {
-                    idle_ms = idle_ms.min(2_000);
-                    keep = bytes / 2;
-                }
-            }
+            (idle_ms, keep) = window_keep(*band, bytes, window_budget_always(), idle_ms);
         }
     }
     let gone: Vec<Arc<Shadow>> = {
@@ -5505,9 +5535,41 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of, window_victims,
+        WINDOW, always_from, cover, default_card_limits_mb, grid, holder, longest_tail,
+        resolve_card_limits, tail_of, window_keep, window_of, window_victims,
     };
+
+    #[test]
+    fn window_budget_always_switch_is_only_the_exact_one() {
+        use std::ffi::OsStr;
+        assert!(!always_from(None));
+        for off in ["0", "", "true", "yes", "2", "1 ", "on"] {
+            assert!(!always_from(Some(OsStr::new(off))), "{off:?} must not turn it on");
+        }
+        assert!(always_from(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn window_budget_keeps_the_band_gate_unless_asked() {
+        use crate::host::RamBand;
+        const M: u64 = 1 << 20;
+        const IDLE: u64 = 10_000;
+        // PR #77's table, unchanged: Calm leaves every copy alone and keeps
+        // the idle time; Watch holds to the cap; High to half of it.
+        assert_eq!(window_keep(RamBand::Calm, 512 * M, false, IDLE), (IDLE, u64::MAX));
+        assert_eq!(window_keep(RamBand::Watch, 512 * M, false, IDLE), (10_000, 512 * M));
+        assert_eq!(window_keep(RamBand::High, 512 * M, false, IDLE), (2_000, 256 * M));
+        // Asked for, the cap is the operator's number in every band: the
+        // same bytes, the same idle time, whatever the band says. This is
+        // the whole point of the switch - a host whose band rests in High
+        // would otherwise measure `budget / 2` and call it `budget`.
+        for budget in [1 * M, 512 * M, 1024 * M, 2048 * M] {
+            for band in [RamBand::Calm, RamBand::Watch, RamBand::High] {
+                assert_eq!(window_keep(band, budget, true, 300_000), (300_000, budget));
+                assert_eq!(window_keep(band, budget, true, IDLE), (IDLE, budget));
+            }
+        }
+    }
 
     #[test]
     fn window_budget_evicts_oldest_only_until_it_fits() {
