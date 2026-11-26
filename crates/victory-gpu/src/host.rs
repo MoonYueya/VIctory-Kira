@@ -7857,6 +7857,22 @@ fn split_line(frames: f64) {
 /// spread over the threads kept for the snapshots (`crate::shadow::wide`).
 /// The write-watch journal and the guards are behind their own locks, as
 /// they are for the title's threads.
+/// Whether the heavy watch mode's refreshes go to the kept threads by
+/// index (`VICTORY_WIDE_HEAVY=1`) or as one job a copy, as before.
+///
+/// A job a copy is a boxed closure in a queue for each of them (thousands
+/// of them, the heap's buffer views once a frame); an index into one taken
+/// vector is what the light mode has always used. Neither copies different
+/// bytes (`parallel_and_serial_buffer_refreshes_copy_the_same_merged_ranges`).
+fn wide_heavy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if std::env::var_os("VICTORY_WIDE_HEAVY").is_some_and(|v| v == "1") {
+            return true;
+        }
+        wide_refresh()
+    })
+}
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -8411,7 +8427,7 @@ impl Batch {
         #[cfg(feature = "diagnostics")]
         let (began, all) = (std::time::Instant::now(), self.refreshes.len());
         let _flush = crate::timeline::span("refreshes of copies");
-        self.flush_all();
+        self.flush_all(wide_heavy());
         #[cfg(feature = "diagnostics")]
         {
             SPLIT[6].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -8420,7 +8436,7 @@ impl Batch {
         }
     }
 
-    fn flush_all(&mut self) {
+    fn flush_all(&mut self, parallel: bool) {
         // Most of a flush's copies are as they were: they are told so here,
         // from what the submission's asking found, before anything is asked
         // and any thread woken. (Thousands of them, the heap's buffer views
@@ -8450,7 +8466,7 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        if parallel && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
@@ -8458,26 +8474,20 @@ impl Batch {
             let before = PREPARING[0].load(Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
-            if light {
-                // A number to a free thread, not a job to each copy.
-                let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        #[cfg(feature = "diagnostics")]
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                    Self::update(shadow, *from, *to);
-                });
-            } else {
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                    .refreshes
-                    .drain(..)
-                    .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
-                    .collect();
-                crate::shadow::wide_run(jobs);
-            }
+            // A number to a free thread, not a job to each copy, whichever
+            // watch mode: the light one dropped the copies that changed
+            // nothing here first, the heavy one cannot (nothing_new is only
+            // meaningful when view memory is tracked).
+            let refreshes = std::mem::take(&mut self.refreshes);
+            crate::shadow::wide_each(refreshes.len(), move |i| {
+                let (shadow, from, to) = &refreshes[i];
+                if light && refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
+                    #[cfg(feature = "diagnostics")]
+                    FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Self::update(shadow, *from, *to);
+            });
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
@@ -10837,6 +10847,41 @@ mod refresh_tests {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
+
+    /// A flush copies the same bytes whether its copies go one at a time or
+    /// several at a time: the parallel path must not drop or reorder what a
+    /// copy writes, in either watch mode.
+    #[test]
+    fn parallel_and_serial_buffer_refreshes_copy_the_same_merged_ranges() {
+        const COPIES: usize = 16;
+        const LEN: usize = 4096;
+        let refresh = |parallel: bool| {
+            let source: Vec<Vec<u8>> = (0..COPIES)
+                .map(|i| (0..LEN).map(|byte| (i + byte * 3) as u8).collect())
+                .collect();
+            let mut output = vec![vec![0xffu8; LEN]; COPIES];
+            let mut batch = Batch::default();
+            for (input, output) in source.iter().zip(&mut output) {
+                let start = input.as_ptr() as usize;
+                let copy =
+                    crate::shadow::Shadow::unbacked(start as u64, output.as_mut_ptr(), LEN as u64, false);
+                batch.add(&copy, start + 128, 1024);
+                batch.add(&copy, start + 1024, 1024);
+            }
+            assert_eq!(batch.refreshes.len(), COPIES, "one entry a copy, merged");
+            batch.flush_all(parallel);
+            assert!(batch.refreshes.is_empty(), "a flush takes every copy");
+            for (input, output) in source.iter().zip(&output) {
+                assert_eq!(&output[128..2048], &input[128..2048]);
+                assert!(
+                    output[..128].iter().chain(&output[2048..]).all(|&byte| byte == 0xff),
+                    "nothing else was written"
+                );
+            }
+            output
+        };
+        assert_eq!(refresh(true), refresh(false));
+    }
     use super::{Batch, RamBand, ram_band};
     use std::sync::Arc;
 
