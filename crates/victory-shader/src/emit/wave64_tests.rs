@@ -1025,6 +1025,8 @@ fn both_host_waves_observe_the_lds_flag_after_the_join() {
 /// ([`ir::whole_sections`]), where each section is whole.
 #[test]
 fn two_reductions_that_share_their_end_translate_as_two_sections() {
+        super::with_pairs(|| {
+
     // an arm: save EXEC, the identity `init`, then `op` over the wave up to lane 32's read
     let arm = |init: u32, op: u32| {
         let mut w = vec![
@@ -1098,7 +1100,9 @@ fn two_reductions_that_share_their_end_translate_as_two_sections() {
         assert_eq!(f32::from_bits(got), expected, "s0 = {s0}");
     }
     eprintln!("ran on the hardware device: the maximum or the minimum over the console's 64 lanes");
-}
+
+        });
+    }
 
 /// One console wave of 64 threads summing doubles over the lanes below s0 as the title's
 /// water volumetrics count their lanes (`water_shading:CS_TransmissionVolumetrics`,
@@ -1107,6 +1111,8 @@ fn two_reductions_that_share_their_end_translate_as_two_sections() {
 /// the thread index as a double (`v_cvt_f64_f32`), so the sum is s0 (s0 - 1) / 2.
 #[test]
 fn a_wave_sum_of_doubles_is_the_consoles() {
+        super::with_pairs(|| {
+
     let mut words = vec![
         0x7E3E_0D00, // v_cvt_f32_u32 v31, v0
         0x7E3A_211F, // v_cvt_f64_f32 v[29:30], v31
@@ -1179,7 +1185,9 @@ fn a_wave_sum_of_doubles_is_the_consoles() {
         assert_eq!(f32::from_bits(got), want, "the lanes below {s0}");
     }
     eprintln!("ran on the hardware device: the sums of doubles over the console's 64 lanes");
-}
+
+        });
+    }
 
 // ---- the paired form: a host wave of 32 for each console wave, two lanes a thread ----
 
@@ -1599,6 +1607,8 @@ fn paired_lanes_sum_halves_as_the_consoles_tree() {
 /// count's slots. The same with the count where the base goes is not.
 #[test]
 fn an_allocation_in_units_of_a_size_is_the_idiom() {
+        super::with_pairs(|| {
+
     let program = |base: u32| -> Vec<u8> {
         let words = [
             0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
@@ -1638,4 +1648,6 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     };
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
-}
+
+        });
+    }

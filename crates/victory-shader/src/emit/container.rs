@@ -514,6 +514,8 @@ mod tests {
     /// agree, and those whose fixed elements disagree, keep their modes.
     #[test]
     fn one_register_takes_the_mode_of_its_fixed_elements() {
+        super::super::with_pairs(|| {
+
         let element = |name: &str, row, col, cols, comp, interp, usage| SigElement {
             name: name.into(),
             index: 0,
@@ -557,6 +559,8 @@ mod tests {
         // As outputs nothing is read: the floats keep their defaults too.
         one_mode_per_register(&mut both, false);
         assert_eq!(modes(&both), [2, 3]);
+    
+        });
     }
 
     #[test]

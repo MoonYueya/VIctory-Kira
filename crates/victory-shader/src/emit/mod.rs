@@ -569,6 +569,16 @@ thread_local! {
     static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Runs `f` with the paired form's changes on, as `VICTORY_WAVE_PAIRS=1` gives them: the
+/// tests below describe what that switch turns on, so they ask for it themselves.
+#[cfg(test)]
+pub(crate) fn with_pairs<R>(f: impl FnOnce() -> R) -> R {
+    let was = TEST_PAIRS.replace(Some(true));
+    let r = f();
+    TEST_PAIRS.set(was);
+    r
+}
+
 /// [`emit`] in every form but the paired one, with the wave size the result requires of the
 /// host; where an approximate form translates the program, the paired form instead if it
 /// does.
@@ -3213,6 +3223,8 @@ mod barycentric_tests {
     /// texture is a rasterizer-ordered view.
     #[test]
     fn an_ordered_pixel_program_writes_through_a_rasterizer_ordered_view() {
+        super::with_pairs(|| {
+
         let [e0, e1] = exp_mrt0(4);
         let words = [
             0xBE82_0300, // s_mov_b32 s2, s0
@@ -3261,6 +3273,8 @@ mod barycentric_tests {
         let (features, _) = parts(&shader);
         assert_ne!(features & 0x1000, 0, "no rasterizer-ordered views");
         validate(&shader);
+    
+        });
     }
 
     /// Two kinds of barycentrics read directly: one element per mode.
@@ -3594,6 +3608,8 @@ mod barycentric_tests {
     /// the register (refused by the validator); it takes the uint's.
     #[test]
     fn a_vertex_output_beside_an_integer_takes_its_mode() {
+        super::with_pairs(|| {
+
         use crate::native::VsOutput;
         let words = [
             0x7E02_02F2, // v_mov_b32 v1, 1.0
@@ -3626,6 +3642,8 @@ mod barycentric_tests {
         assert_eq!(mode_at(&shader, 1, 0, 2, 3), 1, "the float2");
         assert_eq!(mode_at(&shader, 1, 2, 2, 1), 1, "the uint2");
         validate(&shader);
+    
+        });
     }
 
     /// The pixel side of that register: the program reads the uint2 at its provoking vertex
@@ -3673,6 +3691,8 @@ mod barycentric_tests {
     /// beside the front face (constant).
     #[test]
     fn an_unread_pixel_input_beside_the_front_face_is_constant() {
+        super::with_pairs(|| {
+
         let words = [
             0x7E04_02F2, // v_mov_b32 v2, 1.0
             0xF800_180F,
@@ -3694,6 +3714,8 @@ mod barycentric_tests {
         let shader = translate_with(HwStage::Ps, &words, io, &isg1, &[target]);
         assert_eq!(mode_at(&shader, 0, 0, 1, 3), 1, "the float");
         validate(&shader);
+    
+        });
     }
 
     /// P10 of an attribute the program interpolates is P1 - P0.

@@ -1866,6 +1866,8 @@ fn v_cvt_f32_f64_matches_ieee754() {
 
 #[test]
 fn whole_wave_f64_sum_and_cvt_f32_f64() {
+        super::with_pairs(|| {
+
     let s_or_saveexec_b32 =
         |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x3D << 8 | src0 as u32;
     let v_mov_dpp8 = |vdst: u8, vsrc: u8, sel: u32| [vop1(0x001, vdst, 0xE9), vsrc as u32 | (sel << 8)];
@@ -2027,7 +2029,9 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
             );
         }
     }
-}
+
+        });
+    }
 
 /// Whether the hardware adapter is an AMD RDNA card's: what the translator
 /// writes for one ([`super::rdna`]) holds there.
