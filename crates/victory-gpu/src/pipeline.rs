@@ -752,6 +752,8 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(all(windows, test))]
+mod audit;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
