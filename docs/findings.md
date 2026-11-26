@@ -266,3 +266,65 @@ eviction of card memory, which lines up with the second.
 Two earlier runs of this build were thrown away: one ran while another build of the layer
 was playing on the same card, and one used a shader cache that the other build had written
 to. Both are excluded above, and neither is a number in this note.
+
+### Upstream VRAM GC and RAM-budget PRs, evaluated on RTX 3080, 2026-11-26
+
+Two open pull requests against `avatarmanz/VIctory-7900XTX` were merged into this
+fork one at a time and measured here, each against the same control (this fork's
+`main`, which has neither): **#72** (`4f0d563`, fence-tracked LRU VRAM collection and
+upload pooling, on unless `VICTORY_GC`/`VICTORY_UPLOAD_POOL` are set to `0`) and **#77**
+(`ffc2cf6`, an opt-in system-RAM pressure band, off unless `VICTORY_WINDOW_BUDGET_MB`
+is set). Same save, same switch set, one prewarmed cache per build (25,764 shaders
+translated, 206 that do not translate), 480 s per run, unattended into the world.
+
+Both merged without a conflict even though #47, #48 and #42 are already in this fork:
+they touch the same three files, not the same hunks.
+
+| | control | #72 | #77 @ 256 MiB |
+|---|---|---|---|
+| World frame time, median | 450 ms | **1,951 ms** | 390 ms |
+| Passes that made none for lack of room (last) | 535 | 492 | **113** |
+| Textures passed over unmapped (last) | 2,516 | **18,436** | 12,000 |
+| Card use / DXGI budget (last) | 9,194 / 7,790 MB | 9,172 / 7,689 MB | 8,254 / 7,545 MB |
+| Private memory (last) | 28,019 MB | 26,913 MB | 25,985 MB |
+| Picture mean / spatial sd, world median | 74.1 / 53.7 | 50.0 / 63.2 | 73.1 / 52.7 |
+| Device removed / panic / untranslated shaders | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+**#72 is a regression here and is not kept.** It was merged, built and run twice; the
+first run was discarded because a workspace test was using the same card. The second,
+alone on the machine, costs 4.3 times the frame time, raises `passed over unmapped`
+from 2,516 to 18,436, uploads 27 % more bytes and darkens the picture by a third, for a
+`lack of room` that falls 8 %. The log gives the reason: the sweep's watermark is 75 %
+of the DXGI local budget, which on a 10 GB card is 5.5-5.9 GB, while the renderer's own
+admission test already fills the card to 90 % of that same budget. The sweep therefore
+takes away host copies the renderer would still use, and the next frame uploads them
+again; five sweeps in 480 s evicted 12,798, 299, 2,130 and 4,501 objects at a time.
+The over-budget path bypasses the 120-frame idle floor and the 64-per-frame cap, so
+the fraction is all that stands between a sweep and an eviction that size.
+
+**#77 is kept, default off as it is.** With `VICTORY_WINDOW_BUDGET_MB=256` the frame
+time falls 13 %, `lack of room` falls 79 %, the card holds 8,254 MB instead of 9,194 MB,
+and the picture is within 2 % of the control. At 2048 MiB the cap never engaged - the
+log has no sweep line and the live window copies were only 1.6-2.0 GB - so that run
+only proves the merge does not regress. Unset, the variable is read in exactly one
+place and the sweep is the one it was.
+
+Two things this measurement does not settle. `passed over unmapped` rose under #77
+(2,516 to 11,298 and 12,000) while frame time and `lack of room` both improved; the two
+were not isolated. And the 2048 MiB run had 3 black frames of 51 world pictures where
+the 256 MiB run and the control had none; the control's own black-frame warnings are
+all inside the first 22 frames (menu and loading), and one picture every 8 world frames
+is a thin sample, so it is recorded as unresolved rather than as a defect.
+
+**A more complete implementation already exists elsewhere.** Marvisak/VIctory at
+`63bcca4` collects card texture copies on a budget in `resource.rs` (`evict_unused`, and
+`BUDGET_HIGH = 0.90` / `BUDGET_LOW = 0.85`, `IDLE_MS = 120_000`, only textures that can
+be rebuilt from title memory, plus a counter for copies evicted and remade soon after),
+called before every submission from `host.rs`. Neither this fork's upstream `main`
+(`39031cb`) nor `fxceless/victory-gta6` has it: fxceless solves the same problem with
+allocation budgets (`VICTORY_TEXTURE_BUDGET_MB`, `VICTORY_TEXTURE_ROOM_PERCENT`,
+`VICTORY_STAGING_POOL_MB`) and has no eviction pass at all. That 90/85 pair is the
+shape a next attempt should take, not #72's 75/67.5.
+
+Full numbers, run ids and grades: `VIctory-Kira-reports/GC72-PR-EVAL-2026-11-26.md`
+(outside this repository).
