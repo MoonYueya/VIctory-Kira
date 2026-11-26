@@ -1129,8 +1129,63 @@ impl View {
 /// They are made when the texture is: translated shaders index the heap
 /// directly, so a slot is not always made again by the draw that reads it.
 #[cfg(windows)]
-static WAITING: std::sync::Mutex<std::collections::BTreeMap<usize, Vec<u64>>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static WAITING: std::sync::LazyLock<std::sync::Mutex<WaitingTextures>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The slots waiting for a texture's host copy, and those of a texture the
+/// host refused for lack of memory, with the time it may be asked about
+/// again (`crate::resource::host_retry_at`; only with
+/// `VICTORY_TEXTURE_RETRY=1`).
+#[cfg(windows)]
+#[derive(Default)]
+struct WaitingTextures {
+    slots: std::collections::BTreeMap<usize, WaitingTexture>,
+    /// (when to ask again, texture): in time order, so a submission takes
+    /// the ones that are due instead of walking every refused texture.
+    retries: std::collections::BTreeSet<(u64, usize)>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct WaitingTexture {
+    handles: Vec<u64>,
+    retry_at: Option<u64>,
+}
+
+#[cfg(windows)]
+impl WaitingTextures {
+    fn add(&mut self, resource: usize, handle: u64) -> &mut WaitingTexture {
+        let entry = self.slots.entry(resource).or_default();
+        if !entry.handles.contains(&handle) {
+            entry.handles.push(handle);
+        }
+        entry
+    }
+
+    fn retry(&mut self, resource: usize, handle: u64, until: u64) {
+        let entry = self.add(resource, handle);
+        if let Some(previous) = entry.retry_at.replace(until) {
+            self.retries.remove(&(previous, resource));
+        }
+        self.retries.insert((until, resource));
+    }
+
+    fn remove(&mut self, resource: usize) -> Option<Vec<u64>> {
+        let WaitingTexture { handles, retry_at } = self.slots.remove(&resource)?;
+        if let Some(until) = retry_at {
+            self.retries.remove(&(until, resource));
+        }
+        Some(handles)
+    }
+}
+
+/// A descriptor slot was left null because the card had no memory for the
+/// texture's host copy: keep its handle for the submitting thread, so the
+/// slot is made once the retry succeeds.
+#[cfg(windows)]
+fn retry_texture(resource: usize, handle: u64, until: u64) {
+    WAITING.lock().unwrap_or_else(|e| e.into_inner()).retry(resource, handle, until);
+}
 
 /// Textures given their host copy since [`make_waiting`] last ran.
 #[cfg(windows)]
@@ -1155,16 +1210,19 @@ fn wait_for(resource: usize, handle: u64) {
     const MOST: usize = 64;
     let many = {
         let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
-        let slots = waiting.entry(resource).or_default();
-        if !slots.contains(&handle) {
-            slots.push(handle);
-        }
-        slots.len() > MOST
+        waiting.add(resource, handle).handles.len() > MOST
     };
     if many {
         // Makes it, and notes it made.
         let _ = crate::resource::host_copy(resource as This);
-    } else if !crate::resource::host_waits(resource as This) {
+    }
+    if let Some(until) = crate::resource::host_retry_at(resource as This) {
+        // The card had no memory for it: the slot is made when the retry
+        // succeeds, from `make_waiting` (`VICTORY_TEXTURE_RETRY=1`).
+        if !crate::resource::title_fills(resource as This) {
+            retry_texture(resource, handle, until);
+        }
+    } else if !many && !crate::resource::host_waits(resource as This) {
         // Made by another thread since the slot was looked at: that making
         // may have been taken by `make_waiting` before this slot was noted.
         texture_made(resource);
@@ -1176,12 +1234,26 @@ fn wait_for(resource: usize, handle: u64) {
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
-    let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
-    for resource in made {
+    let mut ready = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
+    // The textures whose retry is due, oldest first, and only so many: a
+    // submission's driver calls stay bounded even if many refusals ran out
+    // together.
+    const MAX_RETRIES: usize = 32;
+    let now = crate::host::now_ms();
+    ready.extend(
+        WAITING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retries
+            .range(..=(now, usize::MAX))
+            .take(MAX_RETRIES)
+            .map(|&(_, resource)| resource),
+    );
+    for resource in ready {
         let handles = WAITING
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&resource);
+            .remove(resource);
         for handle in handles.into_iter().flatten() {
             // Only if the slot still holds a view of that texture: the
             // title may have written it since (and a view of another
@@ -1226,7 +1298,7 @@ pub(crate) fn forget(resource: usize) {
     WAITING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(&resource);
+        .remove(resource);
     let mut views = views_write();
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
@@ -1842,5 +1914,44 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    /// The retry list keeps one entry per texture, in the order they are
+    /// due, and forgets a texture whose record went.
+    #[cfg(windows)]
+    #[test]
+    fn waiting_textures_keep_one_retry_each_in_time_order() {
+        let mut waiting = WaitingTextures::default();
+        waiting.retry(7, 0x1000, 900);
+        waiting.retry(7, 0x2000, 1200);
+        waiting.retry(3, 0x3000, 500);
+        // The later time replaces the earlier one, and one entry a texture
+        // stays: both handles are still worth making a slot of.
+        assert_eq!(waiting.retries.iter().copied().collect::<Vec<_>>(), [(500, 3), (1200, 7)]);
+        assert_eq!(waiting.slots[&7].handles, [0x1000, 0x2000]);
+        // A released record takes its texture's retries with it.
+        assert_eq!(waiting.remove(7), Some(vec![0x1000, 0x2000]));
+        assert_eq!(waiting.retries.iter().copied().collect::<Vec<_>>(), [(500, 3)]);
+        assert_eq!(waiting.remove(7), None, "a texture is forgotten once");
+    }
+
+    /// A submission takes the textures whose retry is due, and no more than
+    /// its bound: a burst of refusals must not become a burst of driver
+    /// calls on the submitting thread.
+    #[cfg(windows)]
+    #[test]
+    fn due_retries_are_bounded() {
+        let mut waiting = WaitingTextures::default();
+        for resource in 0..100 {
+            waiting.retry(resource, 0x1000 + resource as u64, if resource < 40 { 0 } else { u64::MAX });
+        }
+        // The bound make_waiting takes.
+        const MAX_RETRIES: usize = 32;
+        let due: Vec<usize> =
+            waiting.retries.range(..=(0u64, usize::MAX)).take(MAX_RETRIES).map(|&(_, r)| r).collect();
+        assert_eq!(due.len(), MAX_RETRIES);
+        assert!(due.iter().all(|&r| r < 40));
+        // The ones not taken are still there for the next submission.
+        assert_eq!(waiting.retries.range(..=(0u64, usize::MAX)).count(), 40);
     }
 }
