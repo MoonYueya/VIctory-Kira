@@ -827,3 +827,51 @@ before the fix). Neither changes the outcome above.
 
 Numbers, run ids and grades: `VIctory-Kira-reports/VK-DROPMIPS-1-2026-11-27.md` (outside
 this repository).
+
+### A thread's memory of its asks for host copies (`VICTORY_LOOKUP_CACHE`, off by default)
+
+*Not merged into `main`: the code is on the branch `experiment/lookup` (`f198016`); `main` keeps its older `VICTORY_QUICK_FIND`.*
+
+Ported from `fxceless/victory-gta6` (`32be36d` plus the `bc6ee68` ordering fix, fork pull
+requests #1237 and #1245; `f198016` on the branch `experiment/lookup`, not merged into
+`main`). Every bind of a draw asks the buffer table for the host copy of each buffer it
+reads, and the title asks for the same ranges again and again. A thread now keeps what
+each ask `(address, length, kind)` found, weakly, for as long as the tables have not
+changed; the count of changes is made on the side of each change (an entry that comes is
+counted after it is in, a copy that leaves before it leaves, both under the table's lock),
+and a remembered answer is used only if the count is still the one it was read at.
+
+**It works, and it does not help here.** On the RTX 3080, the reference switch set, one
+diagnostics build, one shader and pipeline cache, the same save template and key schedule,
+430 s in the world each (run ids `ctlA1` off, `ctlB1` and `ctlB2` on):
+
+| world frames, median | `ctlA1` off | `ctlB1` on | `ctlB2` on |
+|---|---|---|---|
+| asks answered from the thread's memory | 0 % | **78.7 %** | **78.8 %** |
+| asks that went to the tables, per frame | 439,000 | 83,000 | 88,000 |
+| frame time, median | **417.2 ms** | 522.8 ms | 520.4 ms |
+| of it preparing a submission | **50.8 ms** | 65.3 ms | 57.1 ms |
+| on the GPU | 70.3 ms | 39.6 ms | 57.2 ms |
+| the card idle, median | **161.7 ms** | 258.4 ms | 283.6 ms |
+| card use / budget, last | 8,656 / 7,035 MB | 8,176 / 7,426 MB | 9,114 / 7,504 MB |
+| lack of room, last | 516 | 507 | 309 |
+| passed over unmapped, last | 12,480 | 12,445 | 8,658 |
+| private memory, peak | 27,575 MB | 26,887 MB | 27,602 MB |
+| free physical, least | 344 MB | 930 MB | 438 MB |
+| device removed / panic / untranslated | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+The cache is doing what it says — nearly four asks in five are answered without touching
+the tables, and the asks that reach them drop by 80 %. The time they were expected to save
+does not appear: preparing a submission got *slower* by 12 to 28 %, and the frame went with
+it. Two things point at the same reading. First, this tree already remembers buffer answers
+per thread (`VICTORY_QUICK_FIND`, `a1bdba4`), so the asks #1237 was written against are not
+the asks this branch makes: the table lookup was measured at 7 % of the recording threads'
+time here, not 54 ms a frame. Second, the deferred work the cache adds (`tables_changed()`
+on every registration, release and window, a `SeqCst` counter on the hot path, a hash map per
+thread) lands on the same recording threads, and the frame line now shows the card idle
+longer, not shorter: the bottleneck moved away from the lookup rather than out of the frame.
+
+It is not taken as a default, and `play.ps1` is unchanged. What would make it worth another
+run: start from a tree with `VICTORY_QUICK_FIND` removed (so the asks it caches are the ones
+the title actually makes), and measure the lookup itself with `VICTORY_PROFILE` before and
+after rather than the frame as a whole.
