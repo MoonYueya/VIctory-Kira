@@ -1494,9 +1494,24 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`]: a quarter of the processor's,
+/// 2 to 6, as before.
+///
+/// `VICTORY_WIDE_THREADS=<n>` sets it (1 to 64): this fork's title keeps
+/// seven cores of its own, so on a processor with more than 24 threads the
+/// old quarter left the wide comparisons under-fed; they take the refresh
+/// of a submission's copies too. More threads take cores from the title's
+/// recording threads, so raised, the frame rate is what says whether it
+/// helps.
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
+            .clamp(1, 64)
+    })
 }
 
 fn workers() -> &'static Workers {
@@ -5506,8 +5521,20 @@ pub(crate) fn exact_line(frames: f64) {
 mod window_tests {
     use super::{
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of, window_victims,
+        tail_of, wide_threads, window_of, window_victims,
     };
+
+    /// The wide comparisons' threads: a quarter of the processor's, 2 to 6
+    /// unless `VICTORY_WIDE_THREADS` says otherwise, and 1 to 64 whatever
+    /// it says.
+    #[test]
+    fn wide_threads_follow_the_switch_and_are_clamped() {
+        let quarter = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        match std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            Some(asked) => assert_eq!(wide_threads(), asked.clamp(1, 64)),
+            None => assert_eq!(wide_threads(), quarter),
+        }
+    }
 
     #[test]
     fn window_budget_evicts_oldest_only_until_it_fits() {
