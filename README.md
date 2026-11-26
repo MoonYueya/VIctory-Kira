@@ -1,35 +1,130 @@
-# VIctory-Kira: VIctory on NVIDIA (RTX 3080)
+# VIctory-Kira: VIctory on NVIDIA (RTX 3080 10 GB)
 
-> **This is the NVIDIA branch** (`MoonYueya/VIctory-Kira`), based on
-> [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) at
-> `e2a28ec`, itself a fork of [VIctory](https://github.com/Marvisak/VIctory).
-> It is aimed at 32-lane NVIDIA hardware (tested on an **RTX 3080 10 GB**) and
-> **contains no game files, code or assets** — you need your own copy of the
-> game. Not affiliated with or endorsed by the game's developer or publisher.
->
-> Open pull requests from upstream are merged here on top of that base, each as a
-> `--no-ff` merge so its author stays in the history:
->
-> | PR | Author | What it changes |
-> |---|---|---|
-> | [#42](https://github.com/avatarmanz/VIctory-7900XTX/pull/42) | gomeaw | Render and depth descriptor scratch is private to each recording thread |
-> | [#66](https://github.com/avatarmanz/VIctory-7900XTX/pull/66) | Mumogg | wave64 builder programs count threads on 32-lane hosts |
-> | [#18](https://github.com/avatarmanz/VIctory-7900XTX/pull/18) | gomeaw | Unique compute thread IDs on tiled wave32 GPUs |
-> | [#10](https://github.com/avatarmanz/VIctory-7900XTX/pull/10) | gomeaw | Wide indirect dispatches split on 32-lane GPUs |
-> | [#4](https://github.com/avatarmanz/VIctory-7900XTX/pull/4) | gomeaw | LDS flag regions run on 32-lane GPUs |
-> | [#58](https://github.com/avatarmanz/VIctory-7900XTX/pull/58) | battledogegames-design | Direct-heap root-signature flags from shader features |
-> | [#17](https://github.com/avatarmanz/VIctory-7900XTX/pull/17) | UwUCammie | A frame is counted after DXGI accepts the present |
->
-> Our own commits on top: `a738c22` (GameInput reports the scripted keys as a
-> stand-in pad in slot 0 when no controller is attached) and `bbcdb0a` (the
-> dynamic descriptor region is sized by where the title's heap ends on NVIDIA).
->
-> Build it with `cargo build --profile diag -p victory --features diagnostics`.
-> The plain default build has frame capture and scripted keys compiled out, and a
-> run of it never leaves the menu.
->
-> Tests on this branch: **936 passed, 0 failed, 45 ignored**. Every merge above
-> was built and tested on its own and kept the count at or above the one before.
+A fork of [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
+(itself a fork of [VIctory](https://github.com/Marvisak/VIctory)), a compatibility
+layer that runs an Xbox Series title natively on Windows from files the user
+supplies. This branch is about **32-lane NVIDIA cards with 10 GB of memory**: it
+carries the open NVIDIA pull requests from upstream, a few fixes of its own, and
+measurements of what helps and what does not on one RTX 3080.
+
+**This repository contains no game files, code or assets.** You need your own copy
+of the game. It is not affiliated with or endorsed by the game's developer or
+publisher.
+
+## Where it stands (2026-11-26)
+
+Tested on one machine only: Windows 11, Ryzen 7 7700, 31 GB RAM, **RTX 3080 10 GB**
+(driver 32.0.16.1742), the Series X profile, `scripts\play.ps1` defaults. Each line
+below is from single runs of 360-480 s in the world, not long sessions.
+
+| | |
+|---|---|
+| Into the world, unattended | yes, every run so far; no device removal |
+| World frame time, median | 320-550 ms a frame (about 2-3 fps), depending on the scene |
+| Where a frame goes | GPU work ~85 ms, GPU idle ~140 ms, CPU preparing ~45-65 ms; the rest is copies and waits |
+| Card memory | ~8.9 GB in use against a DXGI budget of ~7.6 GB, which falls further when system RAM is tight |
+| System memory | 27-29 GB private: **a 32 GB machine is at its limit**; free physical memory drops to tens of MB |
+| Series S profile (`-SeriesS`) | card memory -27 %, private memory -4.4 GB, rendered at 1080p instead of 4K, no faster |
+
+What is known to be wrong here:
+
+- Some textures, skin in particular, come in late or not at all: the card is over
+  its budget, so new textures are passed over for lack of room.
+- The frame rate is far from playable; the bottleneck is on the CPU side
+  (submission, copies, synchronisation), not GPU arithmetic.
+- The first run with a new build or driver is dark and stutters until the pipeline
+  cache is warm (`victory warm --used`).
+
+## How to run it
+
+Requirements are as upstream's below (Windows 10/11 x64, AVX2, Direct3D 12 with
+shader model 6.6 and mesh shaders, the pinned Rust toolchain, MSVC build tools,
+your own dump of the title).
+
+```powershell
+git clone https://github.com/MoonYueya/VIctory-Kira
+cd VIctory-Kira
+copy victory.example.toml victory.toml      # then set your paths, outside this folder
+cargo build --locked --profile diag -p victory --features diagnostics
+target\diag\victory.exe shaders <the shader archives>   # once, translates every shader
+target\diag\victory.exe warm --used                     # for a new build or driver
+scripts\play.ps1 -Exe <path of your copy's executable>
+```
+
+Use the `diag` build: the plain default build has frame capture and scripted keys
+compiled out, and a run of it never leaves the menu. On an NVIDIA card (vendor
+`0x10DE`) `play.ps1` sets `VICTORY_TEXTURE_ROOM_PERCENT=97` (AMD keeps its 90).
+`-Safe` leaves the newer, faster ways out; `-SeriesS` plays the Series S profile.
+Closing heavy background programs before a run gives the card's budget back some room.
+
+[tools/kira-harness](tools/kira-harness) runs the title unattended (scripted keys,
+a save template, a run lock, frame capture, a results file) and turns a run log into
+a baseline table; see its README.
+
+## What is different from upstream
+
+Upstream pull requests merged here, each as a `--no-ff` merge so its author stays
+in the history:
+
+| PR | Author | What it changes |
+|---|---|---|
+| [#47](https://github.com/avatarmanz/VIctory-7900XTX/pull/47) | gomeaw | Dynamic descriptor tables from coalesced free ranges |
+| [#48](https://github.com/avatarmanz/VIctory-7900XTX/pull/48) | gomeaw | Dynamic descriptor ranges reclaimed at GPU completion |
+| [#24](https://github.com/avatarmanz/VIctory-7900XTX/pull/24) | gomeaw | Unrelated buffer slots skipped in each spread heap scan |
+| [#23](https://github.com/avatarmanz/VIctory-7900XTX/pull/23) | gomeaw | Structured buffer reads stay raw on heaps without descriptor twins |
+| [#78](https://github.com/avatarmanz/VIctory-7900XTX/pull/78) | feanorsun | `play.ps1` fails on a missing executable |
+| [#42](https://github.com/avatarmanz/VIctory-7900XTX/pull/42) | gomeaw | Render and depth descriptor scratch private to each recording thread |
+| [#66](https://github.com/avatarmanz/VIctory-7900XTX/pull/66) | Mumogg | wave64 builder programs count threads on 32-lane hosts |
+| [#18](https://github.com/avatarmanz/VIctory-7900XTX/pull/18) | gomeaw | Unique compute thread IDs on tiled wave32 GPUs |
+| [#10](https://github.com/avatarmanz/VIctory-7900XTX/pull/10) | gomeaw | Wide indirect dispatches split on 32-lane GPUs |
+| [#4](https://github.com/avatarmanz/VIctory-7900XTX/pull/4) | gomeaw | LDS flag regions run on 32-lane GPUs |
+| [#58](https://github.com/avatarmanz/VIctory-7900XTX/pull/58) | battledogegames-design | Direct-heap root-signature flags from shader features |
+| [#17](https://github.com/avatarmanz/VIctory-7900XTX/pull/17) | UwUCammie | A frame is counted after DXGI accepts the present |
+| [#69](https://github.com/avatarmanz/VIctory-7900XTX/pull/69) | Adika713 | Memory category log (`VICTORY_MEMORY_CATEGORIES=1`, off by default), ported as `28f166b` |
+| [#77](https://github.com/avatarmanz/VIctory-7900XTX/pull/77) | Adika713 | Idle window budget (`VICTORY_WINDOW_BUDGET_MB`, off by default; on this card it keeps copies rather than capping them, see findings) |
+
+Changes of this branch:
+
+- **On by default**
+  - A stand-in pad in slot 0 shows the scripted keys when no controller is attached
+    (`a738c22`).
+  - The dynamic descriptor region is sized by where the title's heap ends on NVIDIA,
+    so no dynamic table is refused (`bbcdb0a`).
+  - `play.ps1` gives textures 97 % of the card's room on NVIDIA (`9e2763d`).
+- **Off by default, for measuring**
+  - `VICTORY_VRAM_LEDGER=1`: the card's memory by class.
+  - `VICTORY_BUDGET_LOG=1`, `VICTORY_BUDGET_RESERVE_MB`: the DXGI budget over time,
+    and a reservation test.
+  - `VICTORY_POOL_SPARE`: how many empty texture blocks are kept.
+  - `VICTORY_DROP_HOST_COPY=1`: let a texture's host copy go once its upload ran.
+  - `-SeriesS` in `play.ps1`.
+
+Measured on the RTX 3080 and **not** taken, with the numbers, in
+[docs/findings.md](docs/findings.md): upstream PR #72 (VRAM eviction, frame time
+×4 here), the Marvisak eviction water marks (branch `experiment/evict`), a DXGI
+memory reservation, a smaller empty-block cap, and a window budget that is always on
+(branch `experiment/winbudget`).
+
+Tests on this branch: **953 passed, 0 failed, 45 ignored** (`cargo test --workspace`).
+
+## What is next
+
+From a comparison of the NVIDIA forks around (none has RTX 3080 10 GB frame times):
+
+1. The buffer host-copy lookup cache (`VICTORY_LOOKUP_CACHE`, fxceless/victory-fork
+   PR #1237), aimed at the GPU idle time.
+2. Returning dynamic descriptor slots when a flight lands (TaynanGT/Vice-Tay).
+3. Dropping the largest mip levels of title textures (`VICTORY_TEXTURE_DROP_MIPS`,
+   soldsawn/victory-nvidia-8gb), to bring the card under its budget.
+
+Each goes in behind a switch and is A/B-tested on this card before it becomes a
+default.
+
+These changes were made with AI assistance. GPL-3.0-or-later, as upstream.
+
+---
+
+*The rest of this file is upstream's README (avatarmanz/VIctory-7900XTX), unchanged.*
 
 # VIctory on an RX 7900 XTX
 
