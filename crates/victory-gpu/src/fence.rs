@@ -71,6 +71,102 @@ fn set_event(event: usize) {
     let _ = event;
 }
 
+/// Blocking fence waits that are woken when the value moves
+/// (`VICTORY_FENCE_WAKE=1`; off by default, and off leaves every call answered
+/// exactly as it was before this switch existed, `E_NOTIMPL` included).
+///
+/// A null event in `SetEventOnCompletion` asks for "block until the value is
+/// reached": there is nothing to signal, so the thread has to sleep on the
+/// value itself. `WaitOnAddress` does that, and `WakeByAddressAll` on the same
+/// word — the fence's `value`, which is also the address `GetGpuAddress` hands
+/// the title — wakes it the moment a signal, a queue's bottom-of-pipe write or
+/// a settle moves the value.
+///
+/// The wait is bounded: 250 ms in all, in slices of at most 10 ms, and the word
+/// is read again after each slice. A value reached during a slice ends the wait
+/// at once; a value not reached by the end of it is answered as the call always
+/// was (`E_NOTIMPL`), so a title that treats a failure as "poll instead" ends
+/// up where it started rather than hanging.
+///
+/// This waits for the value only. It does not make the value move: what moves
+/// it is a signal, a bottom-of-pipe write, or a settle (`crate::host::late`).
+#[cfg(windows)]
+pub(crate) mod wake {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering::Acquire};
+    use std::time::{Duration, Instant};
+
+    /// Whether blocking waits sleep and are woken (`VICTORY_FENCE_WAKE=1`; off
+    /// by default).
+    pub(crate) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_FENCE_WAKE").is_some_and(|v| v == "1"))
+    }
+
+    /// How long a blocking wait waits before it is answered as it always was.
+    pub(crate) const MOST: Duration = Duration::from_millis(250);
+
+    /// The longest single sleep, so the word is looked at again soon after it
+    /// moves and a waker that arrives between the read and the sleep is not
+    /// missed for long.
+    pub(crate) const SLICE: u32 = 10;
+
+    /// Sleeps until `value` is reached or [`MOST`] has passed: whether it was
+    /// reached.
+    pub(crate) fn until(word: &AtomicU64, value: u64) -> bool {
+        let deadline = Instant::now() + MOST;
+        loop {
+            let seen = word.load(Acquire);
+            if seen >= value {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let ms = (deadline - now).as_millis().min(u128::from(SLICE)) as u32;
+            // SAFETY: `word` is a live atomic the title reads at the fence's GPU
+            // address; `seen` is the value the wait is given up for.
+            unsafe {
+                windows_sys::Win32::System::Threading::WaitOnAddress(
+                    (&raw const *word).cast(),
+                    (&raw const seen).cast(),
+                    size_of::<u64>(),
+                    ms.max(1),
+                );
+            }
+        }
+    }
+
+    /// Wakes every thread waiting on `word`.
+    ///
+    /// # Safety
+    /// `word` must be a live atomic, and stay where it is while it is waited on.
+    pub(crate) unsafe fn wake_all(word: &AtomicU64) {
+        // SAFETY: the caller says the word is live, which is what the address
+        // taken here has to be.
+        unsafe {
+            windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const *word).cast());
+        }
+    }
+}
+
+/// The wait a null event asks for: sleeps on a fence's value until it is
+/// reached or [`wake::MOST`] has passed. `woken` says whether it sleeps at all
+/// (`VICTORY_FENCE_WAKE=1`); off, it answers "not reached" without waiting,
+/// which is what the call did before the switch.
+///
+/// The caller must not hold the fence's waiters while this sleeps: what wakes
+/// it is `set`, which takes them.
+fn blocking_wait(word: &AtomicU64, value: u64, woken: bool) -> bool {
+    #[cfg(windows)]
+    if woken {
+        return wake::until(word, value);
+    }
+    let _ = (word, value);
+    false
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(
         FENCE,
@@ -104,19 +200,38 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::told("an event asked for", this as usize, value);
     if event.is_null() {
-        // With submissions sent to the card and not waited for
-        // (`crate::host::late`) the signal may be behind them: they are
-        // settled, which sets it.
         #[cfg(windows)]
-        if crate::host::late() {
-            drop(waiters);
-            crate::queue::before_sync();
-            crate::host::settle_for_fence();
-            if fence.value.load(Ordering::Acquire) >= value {
-                return S_OK;
+        {
+            // With submissions sent to the card and not waited for
+            // (`crate::host::late`) the signal may be behind them: they are
+            // settled, which sets it.
+            if crate::host::late() {
+                drop(waiters);
+                crate::queue::before_sync();
+                crate::host::settle_for_fence();
+                if fence.value.load(Ordering::Acquire) >= value {
+                    return S_OK;
+                }
+                // Not reached yet: with the wake on this thread waits for the
+                // value here instead of taking the call back (`VICTORY_FENCE_WAKE=1`).
+                if blocking_wait(&fence.value, value, wake::on()) {
+                    return S_OK;
+                }
+                tracing::warn!(value, "blocking fence wait not implemented");
+                return E_NOTIMPL;
             }
-            tracing::warn!(value, "blocking fence wait not implemented");
-            return E_NOTIMPL;
+            // Nothing of ours settles the flights here, but another thread of
+            // the title's (or one of ours) may still move the value: with the
+            // wake on the lock is let go and this thread waits for it. Off, the
+            // call is answered exactly as it was.
+            if wake::on() {
+                drop(waiters);
+                if blocking_wait(&fence.value, value, true) {
+                    return S_OK;
+                }
+                tracing::warn!(value, "blocking fence wait timed out");
+                return E_NOTIMPL;
+            }
         }
         // shortcut: a null event means "block until reached"; nothing can
         // reach it while no GPU work runs, so fail instead of hanging.
@@ -124,6 +239,17 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return E_NOTIMPL;
     }
     waiters.push((value, event as usize));
+    // The value may have moved between the look above and the push (nothing
+    // holds memory writes): an event that arrived then would never be set.
+    // (Belobug's fence.rs re-checks here for the same reason.) This costs a
+    // load and changes nothing when the value has not moved.
+    if fence.value.load(Ordering::Acquire) >= value {
+        let reached = waiters.iter().position(|&(wanted, _)| wanted == value);
+        if let Some(at) = reached {
+            let (_, event) = waiters.remove(at);
+            set_event(event);
+        }
+    }
     S_OK
 }
 /// Diagnostics: the value the title waits on, seen from our side of it
@@ -271,6 +397,16 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
+    drop(waiters);
+    #[cfg(windows)]
+    if wake::on() {
+        // A title thread blocked on this value without an event
+        // (`WakeOnAddress`, `VICTORY_FENCE_WAKE=1`): what it waits for has
+        // moved.
+        // SAFETY: the fence is alive (a wait on it holds a reference), and its
+        // value does not move while it is.
+        unsafe { wake::wake_all(&fence.value) };
+    }
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let _called = crate::timeline::span("a fence set");
@@ -416,5 +552,181 @@ mod tests {
         assert_eq!(slot::<Flags>(queried, 0x58)(queried), 0x2);
         assert_eq!(slot::<Release>(queried, 0x10)(queried), 1);
         assert_eq!(slot::<Release>(f, 0x10)(f), 0);
+    }
+
+    /// A null event with the wake off is answered exactly as it was before the
+    /// switch: `E_NOTIMPL`, and nothing waits.
+    #[cfg(windows)]
+    #[test]
+    fn a_blocking_wait_is_refused_with_the_wake_off() {
+        // SAFETY: plain process environment, set before the switch is first
+        // asked.
+        unsafe { std::env::remove_var("VICTORY_FENCE_WAKE") };
+        assert!(!wake::on(), "the wake runs only when asked for");
+
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        let signal = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
+        // Off: the call comes straight back, as it always did.
+        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        // The refusal leaves the value where it was.
+        assert_eq!(slot::<extern "system" fn(This) -> u64>(f, 0x40)(f), 1);
+        assert_eq!(signal(f, 4), S_OK);
+        // Reached: S_OK with the wake off too, as before.
+        assert_eq!(wait(f, 4, std::ptr::null_mut()), S_OK);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    /// A value already reached is answered at once, without sleeping for it.
+    #[cfg(windows)]
+    #[test]
+    fn a_value_already_reached_is_not_waited_for() {
+        let word = AtomicU64::new(7);
+        let started = std::time::Instant::now();
+        assert!(wake::until(&word, 7), "reached: the wait ends at once");
+        assert!(wake::until(&word, 3), "past it: reached all the same");
+        assert!(
+            started.elapsed() < wake::MOST,
+            "a value already reached must not sleep for the whole wait"
+        );
+    }
+
+    /// A wait on a value that is moved from another thread ends when it is
+    /// moved, and not at the end of the wait.
+    #[cfg(windows)]
+    #[test]
+    fn a_wait_is_woken_when_the_value_arrives() {
+        use std::sync::Arc;
+
+        let word = Arc::new(AtomicU64::new(0));
+        let mover = {
+            let word = Arc::clone(&word);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                word.store(5, Ordering::Release);
+                // SAFETY: the word is alive until the join below.
+                unsafe { wake::wake_all(&word) };
+            })
+        };
+        let started = std::time::Instant::now();
+        assert!(wake::until(&word, 5), "the value arrived");
+        let waited = started.elapsed();
+        mover.join().expect("the mover finishes");
+        assert!(
+            waited < wake::MOST,
+            "woken by the move, not by the end of the wait ({waited:?})"
+        );
+    }
+
+    /// A value that never arrives ends the wait at its bound, and says it did
+    /// not arrive.
+    #[cfg(windows)]
+    #[test]
+    fn a_wait_that_is_never_reached_ends_at_its_bound() {
+        let word = AtomicU64::new(1);
+        let started = std::time::Instant::now();
+        assert!(!wake::until(&word, 2), "it never arrived");
+        let waited = started.elapsed();
+        assert!(
+            waited >= wake::MOST,
+            "the wait runs to its bound ({waited:?})"
+        );
+        assert!(
+            waited < wake::MOST * 3,
+            "and does not run far past it ({waited:?})"
+        );
+    }
+
+    /// The switch is what decides: never asked for here, so off.
+    #[cfg(windows)]
+    #[test]
+    fn the_wake_is_off_unless_asked_for() {
+        // SAFETY: plain process environment, as above.
+        unsafe { std::env::remove_var("VICTORY_FENCE_WAKE") };
+        assert!(!wake::on(), "off unless asked for");
+    }
+
+    /// A null event with the wake on sleeps until the value is moved, and says
+    /// the call was answered by the wait.
+    #[cfg(windows)]
+    #[test]
+    fn a_blocking_wait_is_answered_when_the_value_arrives() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 0, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        // Another thread moves the value to 5 while the wait sleeps on it.
+        let mover = {
+            let f = f as usize;
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let this = f as This;
+                let moved = fence(this);
+                moved.value.store(5, Ordering::Release);
+                // SAFETY: the fence is alive until the wait below returns.
+                unsafe { wake::wake_all(&moved.value) };
+            })
+        };
+        let started = std::time::Instant::now();
+        // The seam with the wake on: this is the branch the switch takes.
+        let reached = blocking_wait(
+            // SAFETY: the fence made above, alive until it is released below.
+            unsafe { &(*f.cast::<Fence>()).value },
+            5,
+            true,
+        );
+        let waited = started.elapsed();
+        mover.join().expect("the mover finishes");
+        assert!(reached, "the wait says the value arrived");
+        assert!(
+            waited < wake::MOST,
+            "woken by the move, not by the end of the wait ({waited:?})"
+        );
+        assert_eq!(wait(f, 5, std::ptr::null_mut()), S_OK, "and the call agrees");
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    /// The seam with the wake off does not sleep: it answers "not reached" at
+    /// once, which is the behaviour the call had before the switch.
+    #[cfg(windows)]
+    #[test]
+    fn a_blocking_wait_with_the_wake_off_does_not_sleep() {
+        let word = AtomicU64::new(1);
+        let started = std::time::Instant::now();
+        assert!(!blocking_wait(&word, 2, false), "not reached, and not waited for");
+        assert!(
+            started.elapsed() < wake::MOST,
+            "the switch off means no sleep at all"
+        );
+    }
+
+    /// A value that moved between the look and the push still sets the event:
+    /// the window Belobug's fence.rs re-checks for.
+    #[cfg(windows)]
+    #[test]
+    fn an_event_is_set_when_the_value_moved_after_it_was_asked_for() {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 0, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        // SAFETY: plain auto-reset event.
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        assert!(!event.is_null());
+        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        let signal = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
+
+        // Asked for before the value moves: registered, not set yet.
+        assert_eq!(wait(f, 5, event), S_OK);
+        // SAFETY: a valid event.
+        assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_TIMEOUT);
+        // It moves: the event is set.
+        assert_eq!(signal(f, 5), S_OK);
+        // SAFETY: as above.
+        assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+
+        // SAFETY: ours.
+        unsafe { CloseHandle(event) };
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 }

@@ -801,6 +801,16 @@ impl Written {
             } else {
                 at.cast::<u64>().write_unaligned(value);
             }
+        };
+        #[cfg(windows)]
+        if crate::fence::wake::on() {
+            // A title thread may be sleeping on this word (`WaitOnAddress`,
+            // `VICTORY_FENCE_WAKE=1`): it has moved.
+            // SAFETY: the title named writable memory, and it stays put for as
+            // long as the title waits on it.
+            unsafe {
+                windows_sys::Win32::System::Threading::WakeByAddressAll(at.cast());
+            }
         }
     }
 }
