@@ -701,3 +701,44 @@ What a next attempt would have to change first: make the policy a ceiling
 uses for card textures (`BUDGET_HIGH` 0.90, `BUDGET_LOW` 0.85); until then a number cannot
 be tuned into doing what its name says. Full numbers, run ids and grades:
 `VIctory-Kira-reports/VK-WINBUDGET-1-2026-11-26.md` (outside this repository).
+
+## Leaving out a texture's largest levels (RTX 3080, 2026-11-27)
+
+soldsawn/victory-nvidia-8gb offers `VICTORY_TEXTURE_DROP_MIPS=N` (b4ff304, 68e6f6a, 7d0e398,
+fc4b3dd, bd2ccd8, c09a44e): host copies of 2D textures the title fills leave out their N
+largest levels, so each keeps about a quarter of its bytes per level. **Off by default, and
+it stays off here.**
+
+Two runs of one binary (`e9aed88`), the same switches, one variable:
+
+| world | off | `=1` |
+|---|---|---|
+| frames / median / worst | 75 / 346 ms / 749 ms | 71 / 402 ms / 1,186 ms |
+| draws median | 4,856 | 4,782 |
+| median by draws (500-1999 / 2000-3999 / 4000+) | 259 / 337 / 353 ms | 329 / 356 / 408 ms |
+| card use / budget, last | 8,920 / 7,417 MB | 10,293 / 7,229 MB |
+| over budget | +1,503 MB | **+3,064 MB** |
+| lack of room, last | 649 | **2,079** |
+| passed over unmapped, last | 15,184 | 10,723 |
+| blocks of texture memory | 2,624 MB / 41 | **4,032 MB / 63** |
+| host copies the title fills | 17,658 / 1,603 MB | 13,964 / 1,840 MB |
+| picture mean / sd | 72 / 38 | 68 / 40 |
+| device removed / panic / untranslated | 0 / 0 / 0 | 0 / 0 / 0 |
+| levels left out | - | 15,584 copies, 10,873 MB |
+
+The mechanism works: detiling, level-by-level copies, read backs and shifted views all ran,
+no device was lost, and 15,584 host copies kept 10,873 MB worth of levels off the card. But
+**the card ended fuller, not emptier**: the block pool grew by 1,408 MB across 22 more blocks
+while the bytes of texturing the title fills rose 15 % on 21 % fewer copies. Smaller textures
+fragment the 64 MiB blocks faster than they save, and the higher pass rate brings more
+textures onto the card. Frame time followed the pool, not the savings: 16 % slower, +15.7 %
+in the busiest draws bucket.
+
+Two things the port needed that upstream did not have, both found by running it: `detile`
+added the level offset twice (once through `staging_layout`, once per part), and the
+staging check reported the title's whole extent, so every reduced texture counted as "not
+all here" and was looked at again 120 frames later (passed over unmapped 4,403 -> 13,454
+before the fix). Neither changes the outcome above.
+
+Numbers, run ids and grades: `VIctory-Kira-reports/VK-DROPMIPS-1-2026-11-27.md` (outside
+this repository).
