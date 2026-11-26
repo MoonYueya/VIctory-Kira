@@ -97,6 +97,11 @@ Changes of this branch:
     and a reservation test.
   - `VICTORY_POOL_SPARE`: how many empty texture blocks are kept.
   - `VICTORY_DROP_HOST_COPY=1`: let a texture's host copy go once its upload ran.
+  - `VICTORY_LOOKUP_CACHE=1`: a thread remembers what its asks for a buffer's host copy
+    found (upstream fxceless/victory-gta6 #1237). It works — 78.7 % of the asks answered
+    from the asking thread's own memory on the RTX 3080 — but the frame time and the CPU
+    time to prepare a submission both went up, not down; the numbers are in
+    [docs/findings.md](docs/findings.md).
   - `-SeriesS` in `play.ps1`.
 
 Measured on the RTX 3080 and **not** taken, with the numbers, in
