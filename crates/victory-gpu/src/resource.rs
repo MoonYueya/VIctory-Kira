@@ -307,6 +307,54 @@ pub(crate) fn target_format(format: u32) -> u32 {
     format
 }
 
+/// Whether a copy into a full-screen single-mip image is waited for before
+/// the call returns (`VICTORY_VIDEO_FLUSH=0` turns it off; on otherwise).
+///
+/// The title refills one full-screen texture every frame while its opening
+/// video runs. Under `VICTORY_THIN` the copy is translated by threads of
+/// ours later, so the list of ours read the frame before: the opening video
+/// stopped and went on. This is the fix of the author of cool_fox
+/// (22d4a74, "a flush for video copies"), measured on an RTX 4060 Laptop:
+/// twelve samples of the opening two seconds apart are all different frames
+/// after the change, the rest of the calls staying asynchronous.
+///
+/// On by default because it is a correctness fix on a path `play.ps1`
+/// already turns on (`VICTORY_THIN=1`): without it the opening video of the
+/// default run stops. It touches nothing but the copy into such a texture.
+#[cfg(windows)]
+pub(crate) fn video_flush() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| video_flush_from(std::env::var_os("VICTORY_VIDEO_FLUSH")))
+}
+
+/// What `VICTORY_VIDEO_FLUSH` says: only an explicit `0` turns it off.
+#[cfg_attr(not(windows), allow(dead_code))] // asked from the list code only
+fn video_flush_from(value: Option<std::ffi::OsString>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+/// Whether a texture of this shape is one the title fills every frame (a
+/// decoded video frame or a full-screen overlay): two dimensions, one level,
+/// at least 1280 by 720, and not a buffer.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))] // asked from the list code only
+fn is_video_frame_desc(dimension: u32, mip_levels: u16, width: u64, height: u32) -> bool {
+    const TEXTURE2D: u32 = 3;
+    dimension == TEXTURE2D && mip_levels == 1 && width >= 1280 && height >= 720
+}
+
+/// Whether the title texture `this` is a full-screen single-mip image the
+/// title fills every frame: a copy into it must take effect before the next
+/// list is recorded, or the frame the list reads is the one before
+/// (`VICTORY_THIN`, whose calls are translated later by threads of ours).
+#[cfg(windows)]
+pub(crate) fn is_video_frame(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let d = resource(this).desc;
+    is_video_frame_desc(d.dimension, d.mip_levels, d.width, d.height)
+}
+
 /// Whether the host copy of the title texture `this` is in a stand-in
 /// format ([`target_format`]): its texels are not laid out as the title's.
 #[cfg(windows)]
@@ -3499,6 +3547,44 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A decoded video frame is a full-screen two-dimensional image with one
+    /// level; that shape and nothing else is what a copy is waited for.
+    #[test]
+    fn a_video_frame_is_a_full_screen_single_mip_image() {
+        const TEXTURE2D: u32 = 3;
+        const TEXTURE1D: u32 = 2;
+        const BUFFER: u32 = 1;
+        const TEXTURE3D: u32 = 4;
+        // What the title's opening video is filled into, and the overlays.
+        assert!(is_video_frame_desc(TEXTURE2D, 1, 1920, 1080));
+        assert!(is_video_frame_desc(TEXTURE2D, 1, 1280, 720));
+        assert!(is_video_frame_desc(TEXTURE2D, 1, 3840, 2160));
+        // Smaller than 1280x720 is something else (the title's own
+        // full-screen passes, and every other two-dimensional image), and a
+        // buffer of 1,280 bytes is not an image at all.
+        assert!(!is_video_frame_desc(TEXTURE2D, 1, 1279, 720));
+        assert!(!is_video_frame_desc(TEXTURE2D, 1, 1280, 719));
+        assert!(!is_video_frame_desc(BUFFER, 1, 1280, 720));
+        // A mip chain is a texture the title reads through, not one it
+        // refills whole every frame.
+        assert!(!is_video_frame_desc(TEXTURE2D, 2, 1920, 1080));
+        assert!(!is_video_frame_desc(TEXTURE2D, 0, 1920, 1080));
+        // Arrays and volumes are laid out level by level: not a frame.
+        assert!(!is_video_frame_desc(TEXTURE1D, 1, 1920, 1080));
+        assert!(!is_video_frame_desc(TEXTURE3D, 1, 1920, 1080));
+    }
+
+    /// The switch is off only when it says so: unset, empty, or anything
+    /// else leaves the flush on, and an explicit "0" turns it off.
+    #[test]
+    fn the_video_flush_switch_is_off_only_on_a_zero() {
+        assert!(video_flush_from(None));
+        assert!(!video_flush_from(Some("0".into())));
+        for other in ["1", "", "false", "no", "00", " 0"] {
+            assert!(video_flush_from(Some(other.into())), "{other:?}");
+        }
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {

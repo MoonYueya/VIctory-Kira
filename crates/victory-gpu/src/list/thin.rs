@@ -141,12 +141,24 @@ impl Front {
         let schedule = {
             let mut inner = held(&recording.inner);
             inner.chunks.push_back(words);
+            inner.handed += 1;
             !std::mem::replace(&mut inner.scheduled, true)
         };
         if schedule {
             held(&READY).push_back(recording.clone());
             WORK.notify_one();
         }
+    }
+
+    /// Hands over what is written and waits until it is translated: the calls
+    /// made so far have reached the list of ours when this returns. Used for
+    /// the copies that must take effect now (into a full-screen video frame),
+    /// whose source the title writes again for the next one.
+    fn flush(&mut self) {
+        let Some(recording) = self.recording.clone() else { return };
+        self.hand_over();
+        let upto = held(&recording.inner).handed;
+        recording.flush_to(upto);
     }
 
     fn close(&mut self) {
@@ -171,6 +183,9 @@ static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// recordings let go of in the middle.
 static CHUNKS: AtomicU64 = AtomicU64::new(0);
 static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Copies into a full-screen video frame waited for ([`crate::resource::is_video_frame`]):
+/// what `VICTORY_VIDEO_FLUSH` is watched by.
+static VIDEO: AtomicU64 = AtomicU64::new(0);
 
 fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -198,6 +213,10 @@ struct Inner {
     back: usize,
     /// That list was closed by the stream.
     closed: bool,
+    /// Streams handed over, and streams translated: a call is in effect on
+    /// the list of ours once its stream is translated ([Recording::flush_to]).
+    handed: u64,
+    translated: u64,
 }
 
 impl Recording {
@@ -219,6 +238,14 @@ impl Recording {
     pub(crate) fn wait(&self) {
         let mut inner = held(&self.inner);
         while !self.done() {
+            inner = self.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Waits until stream `upto` has been translated.
+    fn flush_to(&self, upto: u64) {
+        let mut inner = held(&self.inner);
+        while inner.translated < upto {
             inner = self.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -248,6 +275,8 @@ impl Recording {
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
             inner.kept.push(chunk);
+            inner.translated += 1;
+            self.moved.notify_all();
             if closed {
                 inner.closed = true;
                 let kept = std::mem::take(&mut inner.kept);
@@ -356,6 +385,11 @@ pub(crate) fn line(frames: f64) {
         s[2],
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
+    );
+    #[cfg(feature = "diagnostics")]
+    tracing::info!(
+        "copies into a full-screen video frame waited for per frame (VICTORY_VIDEO_FLUSH): {:.2}",
+        VIDEO.swap(0, Relaxed) as f64 / frames
     );
 }
 
@@ -658,11 +692,21 @@ extern "system" fn copy_texture_region(
         return;
     }
     let boxed = !source_box.is_null();
+    // A copy into a full-screen single-mip image (a decoded video frame): what
+    // the list reads must be this copy, so the stream is translated to it
+    // before the call returns. Left to the threads, the frame the list reads
+    // was the one before (the opening video stopped and went on).
+    // SAFETY: the title passes the location; plain read.
+    let video = crate::resource::video_flush() && unsafe { crate::resource::is_video_frame((*dst).resource) };
     front(this).put_with(
         COPY_TEXTURE,
         &[u64::from(x) | u64::from(y) << 32, u64::from(z) | u64::from(boxed) << 32],
         &[bytes_of(dst, 1), bytes_of(src, 1), bytes_of(source_box, usize::from(boxed))],
     );
+    if video {
+        front(this).flush();
+        VIDEO.fetch_add(1, Relaxed);
+    }
 }
 #[allow(clippy::too_many_arguments)] // the method's own arguments
 extern "system" fn copy_texture_region_x(
@@ -897,6 +941,51 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { *at::<[u32; 3]>(&w[1..], 2, 3) }, [7, 8, 9]);
         assert!(at::<u32>(&w[1..], 2, 0).is_null());
+    }
+
+    /// Handing over takes the words of the front and counts the stream: what
+    /// a flush afterwards asks for is a stream of that recording.
+    #[test]
+    fn handing_over_counts_the_stream() {
+        let recording = Arc::new(Recording::new(0));
+        let mut f = Front::default();
+        f.recording = Some(recording.clone());
+        f.put(Plain::SET_PIPELINE as u64, &[1]);
+        assert!(f.words.len() > 1);
+        f.hand_over();
+        assert!(f.words.is_empty());
+        let inner = held(&recording.inner);
+        assert_eq!(inner.handed, 1);
+        assert_eq!(inner.chunks.len(), 1);
+        assert_eq!((inner.translated, recording.done()), (0, false));
+    }
+
+    /// A flush waits until the stream it handed over is translated, and
+    /// returns when it is: a call is in effect on the list of ours then.
+    #[test]
+    fn a_flush_waits_for_its_stream() {
+        let recording = Arc::new(Recording::new(0));
+        {
+            let mut inner = held(&recording.inner);
+            inner.handed = 1;
+        }
+        let (done, returned) = std::sync::mpsc::channel();
+        let waiting = recording.clone();
+        let thread = std::thread::spawn(move || {
+            waiting.flush_to(1);
+            let _ = done.send(());
+        });
+        // Not translated yet: the flush is still in it.
+        assert!(returned.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+        {
+            let mut inner = held(&recording.inner);
+            inner.translated = 1;
+            recording.moved.notify_all();
+        }
+        returned.recv_timeout(std::time::Duration::from_secs(5)).expect("the flush returned");
+        thread.join().expect("the flushing thread");
+        // What was already translated is not waited for again.
+        recording.flush_to(1);
     }
 
     /// A view's record is the one at the call, also if its slot is written
