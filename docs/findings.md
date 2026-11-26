@@ -109,3 +109,81 @@ each commit naming its source. In short:
 - Belobug: pipeline workers for screen passes, the ambient stand-in's idea, pipeline and
   constant buffer bookkeeping (romainhedouin).
 - ZJOU: render targets not set again; some shader corrections are being looked at.
+
+## RTX 3080 (NVIDIA Ampere) notes
+
+Measured on **this fork at `0a43566`** (the commit before the current one) on one PC:
+RTX 3080 10 GB, driver 32.0.16.1742, **AMD Ryzen 7 7700** (8 cores), **31.1 GB** physical,
+Windows 11 build 26300, 2560x1440, Series X profile, `scripts/play.ps1` switches. Nothing
+here is carried over from another tree: the numbers of the fork this one came from, and of
+upstream VIctory, are different versions and are not comparable with these.
+
+**What the runs did.** Five, all unattended, no window brought to the front and no input
+sent to the desktop: the keys went in through `VICTORY_KEYS`, which the title reads inside
+its own process. Entry used a copy of a save folder that had already been through the first
+setup. Each run was capped (600, 600, 600, 480, 270 s) and ended with `taskkill /T /F`.
+
+| # | run id | switches |
+|---|---|---|
+| A | `xtx-a-default` | `play.ps1` as written |
+| B | `xtx-b-safe` | `-Safe` |
+| C | `xtx-c-debug` | default + `VICTORY_D3D12_DEBUG=1` |
+| D | `xtx-d-audio` | default + `VICTORY_AUDIO_CAPTURE` |
+| E | `xtx-e-slots` | default, minus the fast paths, + `VICTORY_LIST_SLOTS` |
+
+One local change was in every run and is **not** in `0a43566`: 21 lines in
+`crates/victory-hle/src/modules/gameinput.rs` that give pad slot 0 a stand-in carrying the
+scripted keys, because with no pad plugged in the keys never reached slot 0. It changes
+which input the title sees, and nothing else.
+
+### Confirmed
+
+| What | Grade | Evidence |
+|---|---|---|
+| It builds: `cargo build --locked --profile diag -p victory --features diagnostics`, exit 0, 6 warnings that were already there | measured | build log, the same commit |
+| Tests: 916 passed, 0 failed, 45 ignored over 27 test binaries, no crash | measured | `cargo test --workspace --locked` |
+| All five runs reached the world, with no crash and no device removal | measured | A-E: a frame line under 5 frames a second, and the title's own package files opened in the log |
+| A world frame costs **577 ms** (median, A), 310 ms in its best draws bucket, against 50-75 ms on the 7900 XTX | measured | A: 52 world frame lines; the buckets are in the table below |
+| Private memory reaches **29,973 MB of 31.1 GB** (C); the fork's own README says 40-46 GB | measured | A 28,974, B 25,604, C 29,973, D 27,232 MB |
+| The host view heap is capped at 1,000,000 views, and **737,855** of them are addressable by the title once the 262,144 dynamic slots are taken out | read from source | `descriptor/host.rs:1424-1436`, `:1481-1488` |
+| No title slot ever went past the host heap in these runs: the warning for it never fired | measured | A, B, C: 0 occurrences of `title slot past the host heap` |
+| **Dynamic descriptor slots run out on this card, and only with the fast-path switches on**: A asked 774,254 and was refused **120,350**; B (`-Safe`) asked 37,485 and was refused **0** | measured | `copystat`'s `DynamicRefused`; A, B, C, D |
+| `VICTORY_DYNAMIC_SLOTS` cannot raise that ceiling on NVIDIA: below the portable limit the function returns a fixed 2^18 before reading the variable | read from source | `descriptor/host.rs:1424-1436` |
+| Texture upload falls behind under memory pressure: A had 22,046 waiting and 8,404 passed over unmapped; D had **36,466** waiting | measured | A, D: the frame line's texture counts |
+| Of 3,074 material texture slots in 953 world G-buffer draws, **none** was null, "no view" or "never written" | measured | E, `VICTORY_LIST_SLOTS` over 37 frame files |
+| **64 of those 3,074 (2.1%) had been only partly uploaded**, the lowest at 7% of its bytes | measured | E, per-slot `mapped/total` |
+| No graphics pipeline was refused and no shader failed to translate for those draws (the refused ones were 8 compute shaders) | measured | E |
+| **The character's skin is missing**: hair and a collar are drawn, no face, no neck, no ears. **Why is not known** — the 2.1% of material slots only partly uploaded is a candidate, not a cause | measured (symptom), unknown (cause) | B's saved frames, looked at closely; E's per-slot data for the material side |
+| The debugging layer's `id=645` messages come from our own probe heap, not from the title | read from source | `descriptor/host.rs:1384-1392`, two probes, each released at once |
+| Audio out carries sound for 435 of 476 s (91.4%), 48 kHz stereo 16-bit, first sound at 26 s | measured | D, the recorder's own file |
+
+### World frame cost, by draws per frame
+
+The runs reached different depths, so the same bucket is the only fair comparison.
+
+| draws/frame | A default | B `-Safe` | C +debug layer | D +audio |
+|---|---|---|---|---|
+| under 500 | 491.5 ms (n=3) | 715.9 (n=5) | 1,039.6 (n=4) | 581.0 (n=2) |
+| 500-1500 | **310.1** (n=5) | 916.3 (n=6) | 853.1 (n=5) | 2,644 (n=3) |
+| 1500-3000 | 576.9 (n=9) | 739.7 (n=3) | 655.3 (n=3) | 858.7 (n=6) |
+| 3000 and up | 606.1 (n=35) | 836.8 (n=1) | **423.9** (n=7) | 1,305.4 (n=7) |
+
+The two sorts of dropped draw on the same line are not the same thing: `(M being made)`
+is a pipeline still being built and goes away, `and N indirect` is work that is lost for the
+frame and did not converge in any of these runs (median 1,839 in A).
+
+### Refuted, on this hardware
+
+An earlier reading of ours said the title asks for 2,097,152 views, that 1,245,184 of them
+read a null slot, and that this is why character materials are missing. None of the three
+holds at `0a43566`: the 2,097,152 is our own probe heap, the 1,245,184 is the number of
+slots the title **asks for**, and the warning that would show slots going past the heap
+never fired. What the runs do show is 2.1% of material slots only partly uploaded — a
+candidate, not a proven cause. The account of the missing skin itself is in the issue below.
+
+### Filed upstream
+
+Written up as avatarmanz/VIctory-7900XTX
+[#75](https://github.com/avatarmanz/VIctory-7900XTX/issues/75). The dynamic-slot
+exhaustion was already filed there as #35 by someone else on an RTX 5080; the numbers above
+are an independent reproduction, not a new report.

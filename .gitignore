@@ -70,6 +70,11 @@
 *.7z
 *.rar
 
+# The harness's own settings: paths to YOUR build, YOUR title and YOUR scratch folder.
+/tools/kira-harness/kira-harness.local.json
+# ...and anywhere the save folder you feed it was put.
+/tools/kira-harness/data/
+
 # Editor / OS noise
 .vs/
 .idea/
