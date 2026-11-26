@@ -123,6 +123,25 @@ impl Made {
     }
 }
 
+/// The dynamic slots taken and not yet given back, across every view heap,
+/// and the most taken at one time (diagnostics only).
+#[cfg(feature = "diagnostics")]
+static IN_USE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static IN_USE_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The most dynamic descriptor slots taken at one time so far; 0 without
+/// diagnostics. Unlike the counters of `crate::copystat` it is a reading,
+/// not a count of what happened since the last report.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn in_use_peak() -> u64 {
+    IN_USE_PEAK.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[cfg(not(feature = "diagnostics"))]
+pub(crate) fn in_use_peak() -> u64 {
+    0
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -730,8 +749,9 @@ const PAGE_WRITE_AFTER: u64 = 2;
 /// ranges; locks one mutex and calls nothing.
 pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    // Ranges kept until a pass takes them (as many as [`remapped`] keeps
+    // with `VICTORY_CHANGES_COMPACT=1`, else the 2^15 it had).
+    let most = if changes_compact() { 1 << 18 } else { 1 << 15 };
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
@@ -744,9 +764,9 @@ pub(crate) fn page_written(at: usize, len: usize) {
         last.1 = end;
         return;
     }
-    if ranges.len() >= MOST {
+    if ranges.len() >= most {
         PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+        make_room(&mut ranges, most, changes_compact());
     }
     ranges.push((start, end));
 }
@@ -811,9 +831,45 @@ pub(crate) fn remapped(at: usize, len: usize) {
         // No pass runs (no shader that picks textures by index is bound):
         // the slots there are looked at when they are due, as before.
         STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+        make_room(&mut ranges, MOST, changes_compact());
     }
     ranges.push((start, end));
+}
+
+/// Whether a full list of changed ranges is compacted instead of cleared
+/// (`VICTORY_CHANGES_COMPACT=1`; off by default). Clearing it let a texture
+/// uploaded already keep old bytes after its memory changed: the intro's
+/// video frames went back during the streaming bursts (edsuuu/VI-BR-PORT
+/// 87dc3075, after fxceless/victory-fork PR #896).
+fn changes_compact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_CHANGES_COMPACT").as_deref() == Ok("1"))
+}
+
+/// A full list of changed ranges makes room for the next one: compacted
+/// (every change kept, [`compact`]) when `keep`, else cleared, as it was
+/// before the switch.
+fn make_room(ranges: &mut Vec<(u64, u64)>, most: usize, keep: bool) {
+    if keep {
+        compact(ranges, most);
+    } else {
+        ranges.clear();
+    }
+}
+
+/// A full list of changed ranges made room in, keeping every change: those
+/// that touch or overlap made one, then, while more than half of `most` are
+/// left, each two neighbours one range over both (a pass looks at a little
+/// more memory than changed). Clearing the list here instead (as before) let
+/// a texture uploaded already keep old bytes after its memory changed: the
+/// intro's video frames went back during the streaming bursts (after
+/// fxceless/victory-fork PR #896, ported to our tree as 95cddb7f).
+fn compact(ranges: &mut Vec<(u64, u64)>, most: usize) {
+    join(ranges);
+    while ranges.len() > most / 2 {
+        let wide: Vec<(u64, u64)> = ranges.chunks(2).map(|pair| (pair[0].0, pair[pair.len() - 1].1)).collect();
+        *ranges = wide;
+    }
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -1728,7 +1784,14 @@ impl HostHeap {
             return None;
         };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            use crate::copystat::add;
+            add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+            // The slots taken now, against the most taken at one time.
+            let now = IN_USE.fetch_add(u64::from(n), Relaxed) + u64::from(n);
+            IN_USE_PEAK.fetch_max(now, Relaxed);
+        }
         Some(self.count + first)
     }
 
@@ -2564,6 +2627,8 @@ impl HostHeap {
             return;
         };
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).release(at, n);
+        #[cfg(feature = "diagnostics")]
+        IN_USE.fetch_sub(u64::from(n), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -4767,6 +4832,37 @@ mod tests {
         let View::Placed(_, resource, desc) = low.clone() else { unreachable!() };
         assert!(!same_placed_texture(&low, &View::Placed(true, resource, desc)));
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+    }
+
+    /// A full list of changed ranges is made smaller, never emptied: every
+    /// change is still covered.
+    /// The switch decides: compacted (every change kept) or cleared, as
+    /// before it. Off by default, so the old path stays the one measured.
+    #[test]
+    fn a_full_change_list_is_cleared_or_compacted_by_the_switch() {
+        let full = || -> Vec<(u64, u64)> { (0..10u64).map(|i| (i * 10, i * 10 + 1)).collect() };
+        let mut off = full();
+        make_room(&mut off, 8, false);
+        assert!(off.is_empty(), "off: cleared, as before the switch");
+        let mut on = full();
+        make_room(&mut on, 8, true);
+        assert!(!on.is_empty() && on.len() <= 4, "on: made smaller, not emptied");
+        for i in 0..10u64 {
+            assert!(on.iter().any(|r| r.0 <= i * 10 && i * 10 + 1 <= r.1), "change {i} lost");
+        }
+    }
+
+    #[test]
+    fn a_full_change_list_keeps_every_change() {
+        let mut ranges: Vec<(u64, u64)> = (0..10u64).map(|i| (i * 10, i * 10 + 1)).collect();
+        compact(&mut ranges, 8);
+        assert!(ranges.len() <= 4);
+        for i in 0..10u64 {
+            assert!(ranges.iter().any(|r| r.0 <= i * 10 && i * 10 + 1 <= r.1), "change {i} lost");
+        }
+        let mut touching = vec![(0, 5), (5, 9), (20, 30)];
+        compact(&mut touching, 4);
+        assert_eq!(touching, [(0, 9), (20, 30)]);
     }
 
     #[test]

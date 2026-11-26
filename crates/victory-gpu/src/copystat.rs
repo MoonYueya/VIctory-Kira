@@ -54,6 +54,9 @@ pub(crate) enum C {
     DynamicAsked,
     DynamicRefused,
     DynamicNs,
+    /// Draws and dispatches dropped because their tables found no dynamic
+    /// slots (a table with no room, a root view with no slot).
+    DynamicDroppedDraws,
     /// Marker texts for device-removed data (`HostList::note`).
     NoteNs,
     /// Ranges given to shaders (steps), their snapshots, and the bytes
@@ -1280,7 +1283,8 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
-         refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
+         refused, {:.1} ms searching, {:.0} draws dropped for want of one, {:.0} in use at \
+         most; notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
          guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
@@ -1291,6 +1295,8 @@ pub(crate) fn log(frames: f64) {
         c[C::DynamicAsked as usize],
         c[C::DynamicRefused as usize],
         c[C::DynamicNs as usize] / 1e6,
+        c[C::DynamicDroppedDraws as usize],
+        crate::descriptor::host::in_use_peak() as f64,
         c[C::NoteNs as usize] / 1e6,
         c[C::GpuWrites as usize],
         c[C::BackSubmissions as usize],

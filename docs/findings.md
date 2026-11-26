@@ -875,3 +875,47 @@ It is not taken as a default, and `play.ps1` is unchanged. What would make it wo
 run: start from a tree with `VICTORY_QUICK_FIND` removed (so the asks it caches are the ones
 the title actually makes), and measure the lookup itself with `VICTORY_PROFILE` before and
 after rather than the frame as a whole.
+
+## Two external commits read against this tree, RTX 3080 (one ported behind a switch, one already here)
+
+`TaynanGT/Vice-Tay 31e8d23` gives a flight's dynamic descriptor slots back when the
+flight lands instead of at the bury-lag reset 64 flights later, on a host whose
+shader-visible view heap is capped at 1,000,000 slots. **Read against this tree it is
+already here**: `release_completed_tables` (`host.rs`) gives the slots of every flight
+whose fence has completed back through `Detached::release_tables` -> `State::tables_done`,
+on both landing paths and *before* the list is pushed into `line.landed` (`relay_land`
+and `settle`). `bury_lag` holds the host list and its upload memory here, not the slots.
+The upstream commit reaches the same result on top of its own `release_tables` call (its
+parent `d3626d2` already had it); nothing was cherry-picked and no run was spent on it.
+
+That the symptom is absent here is measured, not only read: four runs on the RTX 3080
+(`785da6d`, 420 s of world each, `VICTORY_MEMORY_CATEGORIES=1`) asked for 12,704 to 13,762
+dynamic tables a frame, were **refused none**, dropped **no draw for want of a slot**, and
+peaked at 143,242 to 186,502 slots in use of the 279,998 the region holds (51 to 67 %).
+`bbcdb0a` sizes that region from where the title's heap ends, which is what keeps it out
+of the title's way on this host.
+
+`edsuuu/VI-BR-PORT 87dc3075` compacts a full list of changed memory ranges instead of
+clearing it, so a texture uploaded already is not left with old bytes after its memory
+changed. **That half was missing here**: both `remapped` and `page_written` cleared at
+1<<15. It is ported as `4c8ac33` (author kept) behind `VICTORY_CHANGES_COMPACT=1`, off by
+default, with `make_room` so both branches are tested; the default keeps the old cap and
+the old clear, so one binary can be measured against itself.
+
+| world frames, by draws | A (off) median ms | B (on) median ms |
+|---|---|---|
+| 3,000 to 4,500 | 356.6 (n=12) | 366.9 / 377.6 (n=20 / 22) |
+| 4,500 to 5,500 | 369.0 (n=17) | 365.9 / 374.1 (n=20 / 18) |
+| 5,500 and more | 448.5 (n=16) | 462.4 / 440.1 (n=17 / 15) |
+
+Nothing there is worth a default: no metric moves by more than 10 %, and CPU preparation
+in the busiest bucket moves 5.7 to 9.3 % toward better, inside the noise. The reason is in
+the logs: **the branch the switch changes never ran in these runs**. Both counters that
+count a change range being dropped read **0** in all four (`... (0 dropped)` for the
+ranges under texture views, and 0 kept-then-dropped for the page writes). The defect the
+port fixes does not reproduce in the opening and the first 420 s of the world here, so
+these runs can neither prove nor disprove it; the switch stays off. Four runs, one binary,
+the same cache; A and B entered different scenes (world draws medians 4,079 to 5,023), so
+only draws buckets are compared. 0 device removals, 0 panics, 0 shaders untranslated in
+all four. Full numbers and run ids: `VIctory-Kira-reports/VK-SLOTS-1-2026-11-26.md`
+(outside this repository).
