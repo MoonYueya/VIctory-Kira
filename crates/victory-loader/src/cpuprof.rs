@@ -37,6 +37,11 @@ use windows_sys::Win32::System::Threading::{
 use crate::crash::locate;
 use crate::stacks::{frames_of, name_of, other_threads, start_of};
 
+/// How many of the busiest threads are sampled for a stack each round. A
+/// sample suspends the thread, so this stays small: the processor times above
+/// are what is measured in full, and this only says where that time went.
+const SAMPLE: usize = 6;
+
 /// Names for addresses in our own program, from the symbols beside it.
 ///
 /// Loaded the first time a name is asked for, never at start: a run without
@@ -311,15 +316,43 @@ fn walk(seen: &mut HashMap<u32, Seen>) -> Walk {
         if s.handle.is_null() {
             continue;
         }
+        // The processor time costs nothing to ask and is taken for every
+        // thread, every time: that is the measurement.
         let now = thread_cpu(s.handle).map(|(u, k)| u + k).unwrap_or(s.was);
         s.ran = now.saturating_sub(s.was);
         s.was = now;
-        // WHERE it is going, not just how much: a sample of its stack, the
-        // same way `VICTORY_PROFILE` takes one.
-        let (frames, _) = frames_of(s.handle);
-        out.insert(id, (s.ran, frames));
+        out.insert(id, (s.ran, Vec::new()));
     }
     Walk { threads: out }
+}
+
+/// A stack sample of the threads that ran most since the last walk.
+///
+/// Sampling a stack suspends the thread, so only the few that are actually
+/// working are taken, and never the walk's own thread: a sample of a thread
+/// that is asleep says nothing that its processor time did not already say,
+/// and suspending every thread every round would be a measurement that
+/// changes what it measures.
+fn sample(w: &Walk, seen: &HashMap<u32, Seen>, most: usize) -> HashMap<u32, Vec<u64>> {
+    let mut ran: Vec<(u64, u32)> = w
+        .threads
+        .iter()
+        .filter(|(_, (took, _))| *took > 0)
+        .map(|(id, (took, _))| (*took, *id))
+        .collect();
+    ran.sort_unstable_by(|a, b| b.cmp(a));
+    let mut out = HashMap::new();
+    for (_, id) in ran.into_iter().take(most) {
+        let Some(s) = seen.get(&id) else { continue };
+        if s.handle.is_null() {
+            continue;
+        }
+        let (frames, _) = frames_of(s.handle);
+        if !frames.is_empty() {
+            out.insert(id, frames);
+        }
+    }
+    out
 }
 
 /// Starts the walk if `VICTORY_CPUPROF` says so. `phase` is asked at each
@@ -358,12 +391,14 @@ fn cpuprof(
         // The first walk of all measures against the process's start, which is
         // not the stretch being measured: it is only a base.
         if !first_walk {
-            for (id, (took, frames)) in &w.threads {
+            for (id, (took, _)) in &w.threads {
                 *ran.entry(*id).or_default() += *took;
                 *samples.entry(*id).or_default() += 1;
-                if !frames.is_empty() {
-                    *stacks.entry((*id, phase(), frames.clone())).or_default() += 1;
-                }
+            }
+            // Where the time went: the few threads that were running, taken
+            // while they run.
+            for (id, frames) in sample(&w, &seen, SAMPLE) {
+                *stacks.entry((id, phase(), frames)).or_default() += 1;
             }
         }
         first_walk = false;
