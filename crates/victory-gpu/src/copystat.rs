@@ -963,6 +963,16 @@ fn log_memory() {
         mb(crate::shadow::window_cover()),
         lists[3],
     );
+    // The card's memory by class, live, with the difference to what the
+    // system counts left as `unaccounted` (`vram`). Every fifth memory line,
+    // so that a world segment is a range of numbers rather than one.
+    static LEDGER_LINES: AtomicU64 = AtomicU64::new(0);
+    if crate::vram::on() {
+        crate::vram::log_switches();
+        if LEDGER_LINES.fetch_add(1, Relaxed) % 5 == 0 {
+            tracing::info!("{}", crate::vram::line());
+        }
+    }
     if memory_categories() {
         let fields: &[(&str, u64)] = &[
             ("working set", working),

@@ -421,8 +421,14 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    match &buffer {
+        Some(b) => {
+            #[cfg(feature = "diagnostics")]
+            crate::vram::note(b, crate::vram::class::BUFFER_COPY, size);
+        }
+        None => {
+            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        }
     }
     buffer
 }
@@ -547,8 +553,14 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
-        WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+    match &buffer {
+        Some(b) => {
+            #[cfg(feature = "diagnostics")]
+            crate::vram::note(b, crate::vram::class::WINDOW_COPY, size);
+        }
+        None => {
+            WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        }
     }
     buffer
 }
