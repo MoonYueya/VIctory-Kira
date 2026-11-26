@@ -350,8 +350,11 @@ pub(crate) fn line() -> String {
         row("pieces taken from the blocks (of the textures above)", in_blocks, 0),
         row("blocks of texture memory, whole", block_bytes, block_count),
         row("  of them empty and kept", block_spare, 0),
-        row("  blocks made the whole time, and let go", counts[0], counts[1]),
-        row("  blocks there now, and empty of those", counts[2] << 26, counts[3]),
+        format!("blocks made in all {}, let go {}", counts[0], counts[1]),
+        // The row above counts the bytes of blocks no piece holds; this one
+        // counts the blocks with nothing in them at all, which is what the
+        // pool may let go: the rest of the former is holes inside blocks.
+        format!("blocks there now {}, of them wholly empty {}", counts[2], counts[3]),
         row(
             "card sides of title buffers",
             own[class::BUFFER_COPY].bytes,
