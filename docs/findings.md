@@ -358,6 +358,10 @@ log has no sweep line and the live window copies were only 1.6-2.0 GB - so that 
 only proves the merge does not regress. Unset, the variable is read in exactly one
 place and the sweep is the one it was.
 
+*Correction (2026-11-26):* "never engaged" and "cap" are wrong. The variable is a floor:
+unset, every eligible copy is let go; set, copies are kept up to that size. See "The
+window-copy budget is a floor, not a cap" below.
+
 Two things this measurement does not settle. `passed over unmapped` rose under #77
 (2,516 to 11,298 and 12,000) while frame time and `lack of room` both improved; the two
 were not isolated. And the 2048 MiB run had 3 black frames of 51 world pictures where
@@ -427,6 +431,10 @@ is exactly what #72 answered in the negative at 75 %, and what this run answers 
 no sweep line, and the live window copies were under the cap. Its band only acts when
 system RAM is under pressure, and this host had 22 GB free, so the run is a
 control-equivalent, not a measurement of the cap.
+
+*Correction (2026-11-26):* the band was in fact High for most samples, and the setting
+kept copies rather than capping them; see the next-but-one section on the window-copy
+budget.
 
 ### The DXGI budget under an RTX 3080: what it follows, and what does not bring it back, 2026-11-26
 
@@ -645,3 +653,51 @@ memory.
 
 Conclusion: worth keeping as an opt-in for the card's side, not as a way to lower
 private memory, and not as a default.
+
+### The window-copy budget is a floor, not a cap, so a default cannot help, 2026-11-26
+
+PR #77's `VICTORY_WINDOW_BUDGET_MB` reads as a ceiling and behaves as a floor. In
+`let_go_idle` (`crates/victory-gpu/src/shadow.rs`) the sweep removes **every** eligible
+copy when the variable is unset (`keep = u64::MAX`, `(0..eligible.len()).collect()`), and
+removes only down to `keep` when it is set. Any positive value therefore keeps *more*
+window copies alive than leaving it unset, never fewer. The band gate is a second order
+problem: it is not what stopped the earlier 2048 and 512 MiB runs.
+
+Replaying `ram_band` over the `memory:` line of seven runs (four existing, three new)
+shows the band was High for most samples in all of them — 69 to 76 of 81 to 87 — so the
+earlier reading that those runs "sat in Calm and never engaged" does not hold. What did
+differ is where the eligible bytes settled: 1,028 MB at 2048, 260 MB at 512, 132 MB at
+256, each exactly the value the band computes (`budget / 2` in High). Only the last is
+small enough to look like the unlimited sweep, which is why only that run moved
+`lack of room`.
+
+`VICTORY_WINDOW_BUDGET_ALWAYS=1` (`e89a3d0` on the branch `experiment/winbudget`, not merged into `main`) makes the cap the number
+that was set in every band and leaves the idle time alone, so the byte side of the policy
+can be measured on a host whose band never rests in Calm. It works: the eligible bytes
+then sit at the set value to the megabyte (1,032 for 1024, 512 for 512). It also shows the
+direction — against the same build with no budget, three 430 s runs on RTX 3080:
+
+| | control, no budget | 1024 MiB + ALWAYS | 512 MiB + ALWAYS |
+|---|---|---|---|
+| copies the sweeps let go | **787 / 3,680 MB** | 263 / 1,288 MB | 133 / 656 MB |
+| live window copies, median | 3,556 MB | **4,560 MB** | 3,840 MB |
+| private memory, peak | 28,248 MB | 28,431 MB | 28,037 MB |
+| free physical, least | 523 MB | 401 MB | 407 MB |
+| card use / budget, last | 8,515 / 7,893 MB | 8,871 / 7,782 MB | 8,834 / 7,583 MB |
+| lack of room, last | 425 | 453 | 387 |
+| passed over unmapped, last | 18,105 | **19,502** | 12,772 |
+| picture mean / sd, world | 71.9 / 49.8 | 72.4 / 52.2 | 63.7 / 48.2 |
+| device removed / panic / untranslated | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+So the budget costs memory rather than saving it, and **no default value is recommended**.
+The three runs also entered different scenes (world draws medians 4,517 / 4,930 / 6,300),
+so frame times are only comparable inside draws buckets: there the 1024 MiB run is 29 to
+32 % faster than the control and the 512 MiB run is level. That is not attributable to the
+budget — the queue depths differed by 8,000 as well — and it is not used as a reason for a
+default.
+
+What a next attempt would have to change first: make the policy a ceiling
+(`if used > high { evict down to low }`), which is the shape Marvisak/VIctory `63bcca4`
+uses for card textures (`BUDGET_HIGH` 0.90, `BUDGET_LOW` 0.85); until then a number cannot
+be tuned into doing what its name says. Full numbers, run ids and grades:
+`VIctory-Kira-reports/VK-WINBUDGET-1-2026-11-26.md` (outside this repository).
