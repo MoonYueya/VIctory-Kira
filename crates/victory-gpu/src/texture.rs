@@ -1597,9 +1597,15 @@ pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
-    // The title's extent, not the refresh window: what has to be mapped is
-    // the whole texture, whether or not its largest levels are left out.
-    let size = s.title_bytes;
+    // What this staging buffer reads, not the title's whole extent: a host
+    // copy that leaves out levels reads only the levels it kept, and those
+    // are what has to be mapped (`staging_layout` cropped the window with
+    // them; the levels kept are the small ones, which lie first in title
+    // memory). Reporting the whole extent instead counted every reduced
+    // texture whose largest level had not streamed in as "not all here",
+    // to be looked at again 120 frames later (B-drop1 against A-ctl:
+    // passed over unmapped 4,403 -> 13,454, lack of room 252 -> 1,266).
+    let size = s.read;
     Some((size as u64, !ask || committed(s.memory, size)))
 }
 
@@ -2093,10 +2099,12 @@ mod title_memory_tests {
                 title.size
             );
             assert_eq!(size, expected, "refresh source bytes with {slices} slices");
+            // What the staging buffer reads and what has to be mapped: the
+            // whole texture, or the levels it keeps where some are left out.
             assert_eq!(
                 staged(image, false).unwrap().0,
-                title.size,
-                "original title budget"
+                size,
+                "the staging buffer's own extents"
             );
             let mut last = Last::default();
             let refresh = |last: &mut Last| {
