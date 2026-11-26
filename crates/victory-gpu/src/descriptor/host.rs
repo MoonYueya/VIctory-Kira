@@ -123,6 +123,25 @@ impl Made {
     }
 }
 
+/// The dynamic slots taken and not yet given back, across every view heap,
+/// and the most taken at one time (diagnostics only).
+#[cfg(feature = "diagnostics")]
+static IN_USE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static IN_USE_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The most dynamic descriptor slots taken at one time so far; 0 without
+/// diagnostics. Unlike the counters of `crate::copystat` it is a reading,
+/// not a count of what happened since the last report.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn in_use_peak() -> u64 {
+    IN_USE_PEAK.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[cfg(not(feature = "diagnostics"))]
+pub(crate) fn in_use_peak() -> u64 {
+    0
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -1765,7 +1784,14 @@ impl HostHeap {
             return None;
         };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            use crate::copystat::add;
+            add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+            // The slots taken now, against the most taken at one time.
+            let now = IN_USE.fetch_add(u64::from(n), Relaxed) + u64::from(n);
+            IN_USE_PEAK.fetch_max(now, Relaxed);
+        }
         Some(self.count + first)
     }
 
@@ -2601,6 +2627,8 @@ impl HostHeap {
             return;
         };
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).release(at, n);
+        #[cfg(feature = "diagnostics")]
+        IN_USE.fetch_sub(u64::from(n), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the

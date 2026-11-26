@@ -354,6 +354,13 @@ pub(crate) struct State {
     recording: u64,
 }
 
+/// A draw or dispatch whose table or root view found no dynamic descriptor
+/// slot, and is dropped rather than run with the title's own offsets.
+fn dropped_for_no_slot() {
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::DynamicDroppedDraws, 1);
+}
+
 impl Drop for State {
     fn drop(&mut self) {
         self.release_dynamic_slots();
@@ -1777,6 +1784,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = self.reserve_dynamic(heap, host, 1) else {
+                    dropped_for_no_slot();
                     return false;
                 };
                 if let Some((a, s)) = &shadow {
@@ -1847,6 +1855,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = self.reserve_dynamic(heap, host, 1) else {
+                    dropped_for_no_slot();
                     return false;
                 };
                 self.root_srv_slots
@@ -3320,6 +3329,7 @@ impl State {
             let Some(first) = self.reserve_dynamic(heap, host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
+                dropped_for_no_slot();
                 made.push((slot, u32::MAX));
                 continue;
             };
