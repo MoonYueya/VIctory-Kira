@@ -4010,7 +4010,7 @@ fn make_twinned(
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
                 if let Some(d) = desc.as_mut() {
-                    shift_view_levels(crate::resource::dropped(resource), d);
+                    shift_view_levels(crate::resource::dropped_levels(resource), d);
                 }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;

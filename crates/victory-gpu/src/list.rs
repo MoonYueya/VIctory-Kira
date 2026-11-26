@@ -894,7 +894,7 @@ fn unlike(dst: This, src: This, mapped: bool) -> bool {
     // caller that maps subresources (`mapped`) copies level by level to the
     // levels the host has (`crate::resource::host_subresource`); any other
     // copy with such a texture is skipped.
-    if !mapped && (crate::resource::dropped(src) > 0 || crate::resource::dropped(dst) > 0) {
+    if !mapped && (crate::resource::dropped_levels(src) > 0 || crate::resource::dropped_levels(dst) > 0) {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             tracing::warn!(?dst, ?src, "copy with a texture whose host copy leaves out levels skipped")
@@ -928,7 +928,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         ) {
             // Host copies that leave out different numbers of levels differ
             // in shape: copied level by level below.
-            let levelwise = crate::resource::dropped(dst) != crate::resource::dropped(src);
+            let levelwise = crate::resource::dropped_levels(dst) != crate::resource::dropped_levels(src);
             if unlike(dst, src, true) {
                 return;
             }
@@ -1105,7 +1105,7 @@ extern "system" fn copy_texture_region(
         // Into a host copy without its largest levels: the level it has,
         // or nothing (`crate::resource::drop_levels`).
         let mut dst = dst;
-        if dst.kind != FOOTPRINT && crate::resource::dropped(dst.resource) > 0 {
+        if dst.kind != FOOTPRINT && crate::resource::dropped_levels(dst.resource) > 0 {
             match crate::resource::host_subresource(dst.resource, dst.footprint.offset as u32) {
                 Some(index) => dst.footprint.offset = u64::from(index),
                 None => return,
@@ -1160,7 +1160,7 @@ extern "system" fn copy_texture_region(
                 && src.footprint.offset as u32 == dst.footprint.offset as u32;
             // From a host copy without its largest levels: the level it
             // has (the same size as the title's), or nothing.
-            if crate::resource::dropped(src.resource) > 0 {
+            if crate::resource::dropped_levels(src.resource) > 0 {
                 match crate::resource::host_subresource(src.resource, src.footprint.offset as u32) {
                     Some(index) => from.footprint.offset = u64::from(index),
                     None => return,

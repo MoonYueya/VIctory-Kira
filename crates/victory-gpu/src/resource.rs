@@ -1542,15 +1542,32 @@ fn fills(desc: &ResourceDesc) -> bool {
 /// between such a texture and another are skipped (`list.rs` `unlike`).
 #[cfg(windows)]
 pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
-    const TEXTURE_2D: u32 = 3;
+    levels_left_out(desc, switch())
+}
+
+/// The switch's value, read once: levels to leave out, at most 4, 0 when it
+/// is not set (the default: host copies keep every level and the branch
+/// below returns at its first test, so nothing else changes).
+#[cfg(windows)]
+fn switch() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let n = *N.get_or_init(|| {
+    *N.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_DROP_MIPS")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(0)
             .min(4)
-    });
+    })
+}
+
+/// How many of its largest levels the host copy of a texture described by
+/// `desc` leaves out when the switch asks for `n` ([drop_levels]): at most
+/// `n`, never all of them (a texture keeps at least one level), and none
+/// at all where the levels left out would not halve the sides exactly into
+/// whole 4-texel blocks.
+#[cfg(windows)]
+fn levels_left_out(desc: &ResourceDesc, n: u32) -> u32 {
+    const TEXTURE_2D: u32 = 3;
     if n == 0 || !fills(desc) || desc.dimension != TEXTURE_2D || desc.sample_count > 1 {
         return 0;
     }
@@ -1565,7 +1582,7 @@ pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
 
 /// [`drop_levels`] of title resource `this`; 0 for buffers and null.
 #[cfg(windows)]
-pub(crate) fn dropped(this: This) -> u32 {
+pub(crate) fn dropped_levels(this: This) -> u32 {
     if this.is_null() {
         return 0;
     }
@@ -1577,7 +1594,7 @@ pub(crate) fn dropped(this: This) -> u32 {
 /// level it leaves out.
 #[cfg(windows)]
 pub(crate) fn host_subresource(this: This, index: u32) -> Option<u32> {
-    let drop = dropped(this);
+    let drop = dropped_levels(this);
     let mips = u32::from(resource(this).desc.mip_levels).max(1);
     let (mip, slice) = (index % mips, index / mips);
     (mip >= drop).then(|| mip - drop + slice * (mips - drop))
@@ -1595,7 +1612,7 @@ pub(crate) fn title_subresources(this: This) -> u32 {
 /// their native subresource numbering. Shrunken textures support plane zero.
 #[cfg(windows)]
 pub(crate) fn readback_subresource(this: This, index: u32) -> Result<u32, &'static str> {
-    if dropped(this) == 0 {
+    if dropped_levels(this) == 0 {
         return Ok(index);
     }
     let desc = &resource(this).desc;
@@ -3496,6 +3513,8 @@ mod tests {
         // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
         assert_eq!(family(59), 53);
         assert_eq!(family(66), 66);
+    }
+
     /// Views of a host copy without its largest level keep their texels:
     /// a view of title level 0 alone shows host level 0 (title level 1),
     /// one of levels 3 and 4 shows host levels 2 and 3, all levels stay all.
@@ -4025,7 +4044,7 @@ mod tests {
         // The selected second-slice mip must move when the mode is active.
         // SAFETY: the resource owns this host texture.
         let host_desc = unsafe { host_resource(image).unwrap().GetDesc() };
-        let drop = dropped(image);
+        let drop = dropped_levels(image);
         assert_eq!(
             (
                 host_desc.Width,
@@ -4143,6 +4162,116 @@ mod tests {
         }
         for object in [list, allocator, output, source, image] {
             slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+    }
+
+    // ---- levels left out of host copies (VICTORY_TEXTURE_DROP_MIPS) ----
+
+    /// 512x512 RGBA8, 10 levels, the title fills it: the smallest texture
+    /// `levels_left_out` leaves levels of.
+    fn droppable() -> ResourceDesc {
+        ResourceDesc {
+            depth_or_array_size: 1,
+            ..texture(512, 512, 28, 10)
+        }
+    }
+
+    /// N = 0, the default, leaves out nothing: every 2D texture the title
+    /// fills keeps all its levels and its full size on the host.
+    #[test]
+    #[cfg(windows)]
+    fn no_levels_are_left_out_by_default() {
+        for desc in [
+            droppable(),
+            ResourceDesc { mip_levels: 1, ..texture(512, 512, 28, 1) },
+            texture(64, 64, 28, 10),
+            buffer(4096),
+        ] {
+            assert_eq!(levels_left_out(&desc, 0), 0, "the default leaves out nothing: {desc:?}");
+        }
+        // And the switch is off unless it is set: an unset variable parses
+        // as 0, which is what a run that never sets it gets.
+        if std::env::var_os("VICTORY_TEXTURE_DROP_MIPS").is_none() {
+            assert_eq!(switch(), 0, "the switch is off when it is not set");
+        }
+    }
+
+    /// N at or past a texture's level count still leaves the host copy one
+    /// level: a texture cannot have none, and a host level 0 of nothing
+    /// would divide the host texture by more than it has.
+    #[test]
+    #[cfg(windows)]
+    fn a_texture_keeps_at_least_one_level() {
+        let four = ResourceDesc { mip_levels: 4, ..texture(512, 512, 28, 4) };
+        for n in 0..=6u32 {
+            let left = levels_left_out(&four, n);
+            assert!(left < 4, "N={n} leaves at least one of four levels: {left}");
+        }
+        // Exactly its levels minus one at the boundary, and never more.
+        assert_eq!(levels_left_out(&four, 3), 3);
+        assert_eq!(levels_left_out(&four, 4), 3);
+        assert_eq!(levels_left_out(&four, 100), 3);
+        // One level: nothing to leave out, whatever the switch says.
+        let single = ResourceDesc { mip_levels: 1, ..texture(512, 512, 28, 1) };
+        for n in 0..=6u32 {
+            assert_eq!(levels_left_out(&single, n), 0, "a one-level texture keeps its level");
+        }
+    }
+
+    /// The subresource mapping a copy, a read back and a refresh go by:
+    /// title level `m` of slice `s` is host subresource
+    /// `(m - drop) + s * (mips - drop)`, and a level the host copy leaves
+    /// out has none at all.
+    #[test]
+    #[cfg(windows)]
+    fn host_subresources_skip_what_was_left_out() {
+        // The mapping itself, as `host_subresource` computes it.
+        let map = |drop: u32, mips: u32, index: u32| {
+            let (mip, slice) = (index % mips, index / mips);
+            (mip >= drop).then(|| mip - drop + slice * (mips - drop))
+        };
+        // Four levels, two slices, one level left out.
+        let (mips, drop) = (4u32, 1u32);
+        assert_eq!(map(drop, mips, 0), None, "title level 0 was left out");
+        assert_eq!(map(drop, mips, 1), Some(0), "title level 1 is host level 0");
+        assert_eq!(map(drop, mips, 3), Some(2), "title level 3 is host level 2");
+        assert_eq!(map(drop, mips, 4), None, "level 0 of the second slice");
+        assert_eq!(map(drop, mips, 5), Some(3), "slice 1 starts after slice 0's three");
+        assert_eq!(map(drop, mips, 7), Some(5), "the last subresource");
+        // Nothing left out: the title's own numbering, which is what an
+        // unset switch has to reproduce byte for byte.
+        for index in 0..8 {
+            assert_eq!(map(0, mips, index), Some(index));
+        }
+        // Two levels out of eight, one slice.
+        assert_eq!(map(2, 8, 0), None);
+        assert_eq!(map(2, 8, 1), None);
+        assert_eq!(map(2, 8, 2), Some(0));
+        assert_eq!(map(2, 8, 7), Some(5));
+    }
+
+    /// A host copy that leaves out levels keeps off the tile path, whose
+    /// tile pool numbers levels as the title does: `hosted` takes it only
+    /// when the shape fits `and` no level is left out, so the smallest
+    /// switch setting already closes it.
+    #[test]
+    #[cfg(windows)]
+    fn a_reduced_host_copy_stays_off_the_tile_path() {
+        let desc = droppable();
+        // The shape test `hosted` gates the tile path on, before the
+        // levels are asked about.
+        let shape_fits = fills(&desc)
+            && desc.dimension == 3
+            && desc.depth_or_array_size == 1
+            && desc.mip_levels > 1
+            && desc.sample_count <= 1;
+        assert!(shape_fits, "this texture would be tile-shaped on its own");
+        assert_eq!(levels_left_out(&desc, 1), 1, "the switch leaves a level out");
+        // `hosted`: shape_fits && dim == 2D && ... && drop_levels == 0.
+        let tiles = |n: u32| shape_fits && levels_left_out(&desc, n) == 0;
+        assert!(tiles(0), "unchanged by default: the texture keeps its levels on the tile path");
+        for n in 1..=4 {
+            assert!(!tiles(n), "N={n} keeps the reduced copy off the tile path");
         }
     }
 

@@ -184,7 +184,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     crate::resource::want_level(placed, 0);
     // Host copies with other levels than each other's: filled from title
     // memory instead (`crate::resource::drop_levels`).
-    if crate::resource::dropped(placed) != crate::resource::dropped(source) {
+    if crate::resource::dropped_levels(placed) != crate::resource::dropped_levels(source) {
         return false;
     }
     let (Some(to), Some(from)) = (
@@ -1455,7 +1455,7 @@ impl Staging {
             }
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip + self.shift, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip + self.first_mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
@@ -1597,7 +1597,9 @@ pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
-    let size = s.read.min(s.title_bytes);
+    // The title's extent, not the refresh window: what has to be mapped is
+    // the whole texture, whether or not its largest levels are left out.
+    let size = s.title_bytes;
     Some((size as u64, !ask || committed(s.memory, size)))
 }
 
@@ -1770,9 +1772,18 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 fn staging_layout(
     mut layout: victory_formats::texture::Layout,
     drop: u32,
+    begins_at_level_zero: bool,
 ) -> (victory_formats::texture::Layout, u32) {
     use victory_formats::texture::Dimension;
-    if drop == 0 || layout.desc.dimension != Dimension::Tex2d || layout.slices != 1 {
+    // The folded layout starts at title level `drop`; a host copy that
+    // begins at a larger level of the title (levels held on demand) would
+    // need the layout re-based again, so it keeps the title's layout and
+    // its parts are shifted by `drop` at the copy (`first_mip`).
+    if drop == 0
+        || !begins_at_level_zero
+        || layout.desc.dimension != Dimension::Tex2d
+        || layout.slices != 1
+    {
         return (layout, drop);
     }
     // drop_levels always leaves a mip. A cutoff within the packed tail
@@ -1868,10 +1879,12 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     // (Either the title's first levels are left out and the staging buffer
     // begins at them -- `staging_layout` folds that into the layout -- or
     // the host copy begins at a level views start at; never both.)
-    let (layout, first_mip) = staging_layout(layout, crate::resource::drop_levels(&desc));
-    // A host copy without its largest levels reads only the levels it kept:
-    // they lie first in title memory (`staging_layout`).
-    let read = read.min(layout.size as usize);
+    let (layout, first_mip) =
+        staging_layout(layout, crate::resource::drop_levels(&desc), first == level0);
+    // A host copy without its largest levels reads only the levels it kept
+    // (`staging_layout`): they lie first in title memory, and the rest is
+    // never detiled, watched or hashed.
+    read = read.min(layout.size as usize);
     let s = Arc::new(Staging {
         buffer,
         base,
@@ -1967,7 +1980,7 @@ mod title_memory_tests {
                 .map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8)
                 .collect();
             for drop in [1, 2, 4] {
-                let (source, first) = super::staging_layout(title.clone(), drop);
+                let (source, first) = super::staging_layout(title.clone(), drop, true);
                 assert_eq!(first, 0);
                 assert!(source.size < title.size);
                 let read = &bytes[..source.size as usize];
@@ -2065,7 +2078,8 @@ mod title_memory_tests {
                 ),
                 object::S_OK
             );
-            let upload = staging(image, resource::host_resource(image).unwrap()).unwrap();
+            let copy = resource::host_copy(image).unwrap();
+            let upload = staging(image, &copy, 0).unwrap();
             let (at, size) = staged_memory(image).unwrap();
             assert_eq!(at, address);
             let cropped = drop > 0 && slices == 1;
@@ -2080,7 +2094,7 @@ mod title_memory_tests {
             );
             assert_eq!(size, expected, "refresh source bytes with {slices} slices");
             assert_eq!(
-                staged(image).unwrap().0,
+                staged(image, false).unwrap().0,
                 title.size,
                 "original title budget"
             );
