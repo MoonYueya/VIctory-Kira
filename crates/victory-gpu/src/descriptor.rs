@@ -531,6 +531,16 @@ pub(crate) fn sync_line(frames: f64) {
             lost as f64 / frames
         );
     }
+    // Writes of no placed texture view, which need nothing of the spans'
+    // lock when the slot is not in them (VICTORY_SPANS_QUICK).
+    let [left_alone, took] = [0, 1].map(|i| host::SPANS_QUICK[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    if left_alone > 0 || took > 0 {
+        tracing::info!(
+            "writes of no placed texture view per frame: {:.0} left the spans' lock alone (VICTORY_SPANS_QUICK), {:.0} took it",
+            left_alone as f64 / frames,
+            took as f64 / frames
+        );
+    }
     let [pages, looked, mirrored, micros, tabled, later, waited] = [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let split = [0, 1, 2, 3, 4].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
     let kinds = [0, 1, 2, 3, 4].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);

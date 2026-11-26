@@ -225,7 +225,33 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// The slots that may be in `placed` (a slot noted there is put here
+    /// under its lock, and taken out when it is forgotten there; a slot
+    /// another's view made stale stays, which says only "may"): a write of
+    /// any other view needs nothing of `placed` ([`spans_quick`], from
+    /// Belobug a284ca7, a-publier).
+    spanned: Slots,
 }
+
+/// Whether a slot's write of no placed texture view leaves `placed` alone
+/// when the slot is not in it ([`HostHeap::spanned`]; from Belobug a284ca7,
+/// a-publier, where it is on by default; here `VICTORY_SPANS_QUICK=1` turns
+/// it on and the pass is the one this tree had).
+///
+/// Every record the pass over records copied as bytes mirrored went by that
+/// one lock of the heap, from six threads, with the title's own threads and
+/// the texture passes: 4 of the 16 ms a frame the submitting thread waited
+/// for that pass were its threads waiting there (the author's run city4,
+/// timeline 113). What is done is the same: forgetting a slot that is not
+/// there does nothing.
+fn spans_quick() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SPANS_QUICK"))
+}
+
+/// Since the last frame line: writes that left `placed` alone
+/// ([`spans_quick`]), writes that took its lock.
+pub(crate) static SPANS_QUICK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
 /// texture code, which has no heap at hand ([`next_start`],
@@ -1712,6 +1738,7 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            spanned: Slots::new((count + extra) as usize),
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
                 if !sampler {
@@ -2613,8 +2640,21 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        // (Under the slot's lock, as every write of it: whether it is in
+        // `spanned` changes only here.)
+        let in_spans = |index: u32| {
+            let bit = 1u64 << (index % 64);
+            self.spanned
+                .0
+                .get(index as usize / 64)
+                .is_none_or(|w| w.load(std::sync::atomic::Ordering::Acquire) & bit != 0)
+        };
+        let stale = if placed_view.is_none() && !in_spans(index) && spans_quick() {
+            SPANS_QUICK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Vec::new()
+        } else {
             use std::sync::atomic::Ordering::Relaxed;
+            SPANS_QUICK[1].fetch_add(1, Relaxed);
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first, held)| {
                 Some((start, start.saturating_add(placed.bytes(resource)?), first, held))
@@ -2624,6 +2664,7 @@ impl HostHeap {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
+                    self.spanned.put(index);
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first, held);
                     // (Under the lock of `placed`: a later write of one of
@@ -2632,6 +2673,7 @@ impl HostHeap {
                 }
                 None => {
                     placed.forget(index);
+                    self.spanned.remove(index);
                     Vec::new()
                 }
             }
@@ -4778,6 +4820,35 @@ mod tests {
             assert!(neutral_for(&view(8), at).is_none());
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    /// A write of no placed texture view forgets the slot in the spans whether
+    /// it goes by their lock or not (`spans_quick`, from Belobug a284ca7): the
+    /// set `spanned` says which slots may be in `placed`, so a write of any
+    /// other slot needs nothing of them. A slot whose view is noted stays
+    /// marked, also another's view making it stale; one forgotten is unmarked.
+    #[test]
+    fn the_spanned_set_says_which_slots_may_be_in_the_spans() {
+        let spanned = Slots::new(8);
+        // As `note_buffer` asks it: may this slot be in `placed`?
+        let in_spans = |slot: u32| {
+            let bit = 1u64 << (slot % 64);
+            spanned.0.get(slot as usize / 64).is_none_or(|w| w.load(std::sync::atomic::Ordering::Acquire) & bit != 0)
+        };
+        assert!(!in_spans(1) && !in_spans(2));
+        // A view noted in slot 1.
+        spanned.put(1);
+        assert!(in_spans(1) && !in_spans(2));
+        // Slot 1 made stale by slot 2's view of the same memory: it stays in
+        // `first`, so it stays here.
+        spanned.put(2);
+        assert!(in_spans(1) && in_spans(2));
+        // Written with no view: forgotten, and unmarked.
+        assert!(spanned.remove(1));
+        assert!(!in_spans(1));
+        // A slot that was never in them: nothing there to take.
+        assert!(!spanned.remove(3));
+        assert!(!in_spans(3));
     }
 
     /// Memory past the levels a slot's view shows is not its texture's.
