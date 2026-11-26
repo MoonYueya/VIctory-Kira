@@ -3491,6 +3491,10 @@ fn late_helper() {
             if line().target != target {
                 continue;
             }
+            // The card has finished them all: a meter of what the title waits
+            // on can tell a hold here from a wait for the card itself.
+            #[cfg(feature = "diagnostics")]
+            crate::fence::lag::card_done();
             host.settle(&mut submitted, WHY_CARD_DONE);
         }
         land();
