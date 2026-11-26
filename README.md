@@ -50,13 +50,16 @@ copy victory.example.toml victory.toml      # then set your paths, outside this 
 cargo build --locked --profile diag -p victory --features diagnostics
 target\diag\victory.exe shaders <the shader archives>   # once, translates every shader
 scripts\play.ps1 -Exe <path of your copy's executable>  # first run; the caches fill as it goes
-target\diag\victory.exe warm --used                     # after a run, and after a build or driver change
-scripts\play.ps1 -Exe <path of your copy's executable>
+scripts\play.ps1 -Exe <path of your copy's executable>  # later runs: play.ps1 warms them first
 ```
 
 `warm --used` makes the host pipelines earlier runs drew with: it reads the list a run
 writes, so on a fresh clone it warms nothing, and it is the second and later runs that
-benefit. Use the `diag` build throughout: the plain default build has frame capture and
+benefit. `play.ps1` runs it itself before each start when the last run left that list
+(`-NoWarm` skips it), because a cold library makes the frame time double while the world
+compiles what it needs.
+
+Use the `diag` build throughout: the plain default build has frame capture and
 scripted keys compiled out, and a run of it never leaves the menu. On an NVIDIA card (vendor
 `0x10DE`) `play.ps1` sets `VICTORY_TEXTURE_ROOM_PERCENT=97` (AMD keeps its 90).
 `-Safe` leaves the newer, faster ways out; `-SeriesS` plays the Series S profile.
