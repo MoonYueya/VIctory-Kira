@@ -79,7 +79,9 @@ if (settings.dataTemplate) {
 // when it cannot, which is one line per frame for a folder that was never made.
 const captureDir = join(dir, 'shots-raw');
 mkdirSync(captureDir, { recursive: true });
-const switches = { ...opt.env };
+// The settings' own switches first, then the command line's: a run inherits the
+// configuration and overrides only what it is testing.
+const switches = { ...settings.env, ...opt.env };
 if (!settings.noKeys) {
   const events = compile(settings.keys);
   if (events.length) {

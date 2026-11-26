@@ -100,6 +100,16 @@ export function loadSettings(explicit) {
      * folder is no lock at all: both sides take theirs and both start the title.
      */
     lockFile: expand(raw.lock),
+    /**
+     * Switches for every run of this settings file, as a map rather than on the
+     * command line: `--env` splits on commas, and a value with a comma in it
+     * (`VICTORY_CPUPROF=420,840,25,file`) cannot be written that way.
+     *
+     * A switch given on the command line still wins, so one settings file can
+     * carry the run's whole configuration and a single run can change one
+     * thing.
+     */
+    env: raw.env && typeof raw.env === 'object' && !Array.isArray(raw.env) ? Object.fromEntries(Object.entries(raw.env).map(([k, v]) => [k, String(v)])) : {},
   };
   const paths = {
     work: settings.work,
