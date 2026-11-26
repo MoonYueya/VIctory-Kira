@@ -9383,7 +9383,13 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 /// once a process.
 fn budget_log_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_BUDGET_LOG").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| budget_on(std::env::var("VICTORY_BUDGET_LOG").ok().as_deref()))
+}
+
+/// [`budget_log_on`] for the value of `VICTORY_BUDGET_LOG`, which turns the line
+/// on for `1` and for nothing else (`0`, or a word, leaves it off).
+fn budget_on(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
 }
 
 /// What to reserve of the card's own memory, in bytes: VICTORY_BUDGET_RESERVE_MB
@@ -9396,6 +9402,16 @@ fn budget_reserve_wanted() -> Option<i64> {
         let mb = std::env::var("VICTORY_BUDGET_RESERVE_MB").ok()?;
         mb.trim().parse::<i64>().ok()
     })
+}
+
+/// [`budget_reserve_wanted`] in bytes: a size in MB as asked (`0`: no
+/// reservation), a negative one (the `-1` of `--reserve all`) as all `available`
+/// is, and `None` when nothing was asked for.
+fn reserve_bytes(wanted: Option<i64>, available: u64) -> Option<u64> {
+    match wanted? {
+        mb if mb >= 0 => Some((mb as u64) << 20),
+        _ => Some(available),
+    }
 }
 
 /// The process's memory and the PC's, in bytes: working set, private bytes,
@@ -9460,11 +9476,7 @@ fn budget_watch(adapter: &IDXGIAdapter3) {
     SAID.store(ms, Relaxed);
     // The reservation, asked for once (and again if the system gives it back).
     let mut reserve_note = "";
-    let want = match wanted {
-        Some(mb) if mb >= 0 => Some((mb as u64) << 20),
-        Some(_) => Some(own.AvailableForReservation),
-        None => None,
-    };
+    let want = reserve_bytes(wanted, own.AvailableForReservation);
     if let Some(want) = want {
         if !ASKED.load(Relaxed) || (want != 0 && own.CurrentReservation == 0) {
             // SAFETY: a plain call on the adapter this device is on.
@@ -10861,6 +10873,28 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn the_budget_line_is_off_unless_asked_for_with_a_one() {
+        assert!(!super::budget_on(None));
+        assert!(super::budget_on(Some("1")));
+        assert!(super::budget_on(Some(" 1 ")));
+        assert!(!super::budget_on(Some("0")));
+        assert!(!super::budget_on(Some("")));
+        assert!(!super::budget_on(Some("yes")));
+        assert!(!super::budget_on(Some("true")));
+    }
+
+    #[test]
+    fn a_reservation_is_a_size_or_all_the_system_offers() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(super::reserve_bytes(None, 7 * gib), None);
+        assert_eq!(super::reserve_bytes(Some(0), 7 * gib), Some(0));
+        assert_eq!(super::reserve_bytes(Some(2048), 7 * gib), Some(2048 << 20));
+        assert_eq!(super::reserve_bytes(Some(-1), 7 * gib), Some(7 * gib));
+        // Anything below zero is "all of it", not a size.
+        assert_eq!(super::reserve_bytes(Some(-4096), 3 * gib), Some(3 * gib));
     }
 }
 
