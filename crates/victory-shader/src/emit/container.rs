@@ -134,6 +134,11 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
 /// front face, or an input read at its vertices, that float written (outputs) or not read
 /// (inputs).
 pub(crate) fn one_mode_per_register(elements: &mut [SigElement], read: bool) {
+    // It comes with the paired form's commit: a run that does not ask for that keeps the
+    // signatures (and so the emitted modules) it had.
+    if !super::pairs_on() {
+        return;
+    }
     let fixed = |e: &SigElement| e.comp != 9 || e.kind == 13 || (read && e.usage != 0);
     let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
     rows.sort_unstable();

@@ -496,6 +496,12 @@ pub fn emit(
 /// Whether `p` has a `v_permlane16_b32` or `v_permlanex16_b32` that no whole-wave section the
 /// simulation follows ([`wave::sections`]) holds.
 fn permutes_outside_sections(p: &ir::Program) -> bool {
+    // (the whole-section retry it guards comes with the paired form's commit: a run that does
+    // not ask for that keeps the translation it had, even where it permutes lanes outside a
+    // section)
+    if !pairs_on() {
+        return false;
+    }
     let permute = |inst: &ir::Inst| matches!(inst.name(), "v_permlane16_b32" | "v_permlanex16_b32");
     p.blocks.iter().enumerate().any(|(b, block)| {
         if !block.insts.iter().any(permute) {

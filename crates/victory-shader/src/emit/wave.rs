@@ -141,6 +141,10 @@ enum Pair {
 impl Pair {
     /// The pair a lane's two dwords hold, if they are one.
     fn of(lo: Sym, hi: Sym) -> Option<Pair> {
+        // (seeing two dwords as one 64-bit float comes with the paired form's commit)
+        if !super::pairs_on() {
+            return None;
+        }
         match (lo, hi) {
             (Sym::K(0), Sym::K(0)) => Some(Pair::Zero),
             // a lane's own masked value: both dwords picked by one mask, beside +0.0
@@ -551,8 +555,10 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
             let (old_lo, old_hi) = (old(dreg), old(dreg + 1));
             let (mut lo, mut hi) = (Vec::with_capacity(wave as usize), Vec::with_capacity(wave as usize));
             for l in 0..wave as usize {
+                // (the pair reading of \`v_add_f64\` comes with the paired form; a run that
+                // does not ask for it infers what it did before)
                 let sum = match (a[l], b[l]) {
-                    (Some(x), Some(y)) if follows => add64(x, y),
+                    (Some(x), Some(y)) if follows && super::pairs_on() => add64(x, y),
                     _ => None,
                 };
                 let (sl, sh) = sum.map_or((Sym::Unknown, Sym::Unknown), Pair::syms);

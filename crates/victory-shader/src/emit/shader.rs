@@ -514,8 +514,9 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
-        // (bit 12 of the kind field: a UAV; bit 13: rasterizer-ordered)
-        let props = if self.ordered && !sampler && props.0 & 0x1000 != 0 {
+        // (bit 12 of the kind field: a UAV; bit 13: rasterizer-ordered. Ordered views come
+        // with the paired form's commit: a run that does not ask for it keeps ordinary ones.)
+        let props = if self.ordered && super::pairs_on() && !sampler && props.0 & 0x1000 != 0 {
             self.flags |= flags::ROVS;
             (props.0 | 0x2000, props.1)
         } else {

@@ -2214,6 +2214,11 @@ impl<'a> Lower<'a> {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
             Shape::Sum64 { high, lo, hi, mask } => {
+                // (the paired form brings upstream's one-operation sum with it; without it
+                // this branch keeps the translation it had, down to the bytes)
+                if !super::pairs_on() {
+                    return self.active_f64_sum(lo, hi, mask, high);
+                }
                 return self.sum64(lo, hi, mask).map(|d| d[usize::from(high)]);
             }
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
@@ -2319,6 +2324,77 @@ impl<'a> Lower<'a> {
             r
         };
         Ok(if float { self.as_int(r) } else { r })
+    }
+
+    /// `WaveActiveSum` of 64-bit floats (`f64(lo, hi)` in active lanes, `+0.0` elsewhere),
+    /// returning the low (`!high`) or high (`high`) 32-bit word. The translation this branch
+    /// has always made; kept for a run that does not ask for the paired form
+    /// (`VICTORY_WAVE_PAIRS=1`), so that its output does not change.
+    fn active_f64_sum(
+        &mut self,
+        lo: Value,
+        hi: Value,
+        mask: Value,
+        high: bool,
+    ) -> Result<V, Why> {
+        if self.mask_data == MaskData::None {
+            return Err("a wave reduction in a mesh shader");
+        }
+        let c = self.cur;
+        let &m = self
+            .x
+            .st
+            .masks
+            .get(&mask)
+            .ok_or("a wave reduction's untracked mask")?;
+        let on = self.boolean(m, c)?;
+        let on = self.launched(c, on, mask);
+        let lo = self.i32_of(lo)?;
+        let hi = self.i32_of(hi)?;
+        let z = self.s.m.i32(0);
+        let lo = self.s.m.select(c, on, lo, z);
+        let hi = self.s.m.select(c, on, hi, z);
+        self.s.flags |= flags::WAVE_OPS | flags::DOUBLES;
+        let f64t = self.s.m.double();
+        let i32t = self.s.t.i32;
+        let split_ty = self
+            .s
+            .m
+            .named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+        let arg = self
+            .s
+            .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
+        let (k0, k0b) = (self.s.m.i8(0), self.s.m.i8(0));
+        let sum = self
+            .s
+            .op(c, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[arg, k0, k0b]);
+        let split = self
+            .s
+            .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
+        let mut r_lo = self.s.m.extract(c, split, 0);
+        let mut r_hi = self.s.m.extract(c, split, 1);
+        if self.exchange.is_some() {
+            if !self.all_lanes(self.cur_ir) {
+                need(self.cur_ir);
+                return Err("a wave reduction where not every lane runs");
+            }
+            let (lo0, lo1) = self.exchange_halves(self.cur, r_lo);
+            let (hi0, hi1) = self.exchange_halves(self.cur, r_hi);
+            let c = self.cur;
+            let d0 = self
+                .s
+                .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo0, hi0]);
+            let d1 = self
+                .s
+                .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo1, hi1]);
+            let total = self.s.m.bin(c, Bin::Add, d0, d1);
+            let split = self
+                .s
+                .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[total]);
+            r_lo = self.s.m.extract(c, split, 0);
+            r_hi = self.s.m.extract(c, split, 1);
+        }
+        Ok(if high { r_hi } else { r_lo })
     }
 
     /// `op` of `arg` (`float`: a float, else bits) over this host wave's active lanes; with
@@ -12969,7 +13045,9 @@ impl<'a> Lower<'a> {
         let limit = match super::loop_limit() {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
+            // (the ray walk's shorter limit comes with the paired form's commit: a run that
+              // does not ask for it cuts a tracing loop where it always did)
+            LOOP_LIMIT if self.traces && super::pairs_on() => TRACE_LOOP_LIMIT,
             LOOP_LIMIT => 1 << 12,
             named => named,
         };

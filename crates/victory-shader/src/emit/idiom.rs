@@ -180,9 +180,12 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 if *c == Wave::Base { Wave::Base } else { Wave::Prefix }
             }
             // the prefix in units of a plain size, onto the base: the lens-flare scans reserve
-            // their count times the size, and each lane takes base + below × size
+            // their count times the size, and each lane takes base + below × size. It comes
+            // with the paired form, so a run that does not ask for that keeps the forms it
+            // had: three lens-flare scans stay on their per-half form, which is exact for
+            // them.
             ("v_mad_u32_u24" | "v_mad_u32_u16", [Wave::Prefix, Wave::Plain, c] | [Wave::Plain, Wave::Prefix, c])
-                if !wild(*c) =>
+                if !wild(*c) && super::pairs_on() =>
             {
                 if *c == Wave::Base { Wave::Base } else { Wave::Prefix }
             }
