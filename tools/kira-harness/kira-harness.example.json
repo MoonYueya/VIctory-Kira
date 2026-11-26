@@ -32,5 +32,7 @@
       ]
     }
   ],
-  "stopOnWorld": true
+  "stopOnWorld": true,
+  "cacheDir": null,
+  "lock": null
 }

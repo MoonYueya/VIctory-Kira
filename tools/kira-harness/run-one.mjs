@@ -14,7 +14,9 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { assertDiskSpace, ensureDirs, gb, loadSettings, runDir } from './lib/config.mjs';
-import { acquireRunLock, archiveShots, prepareOverlay, releaseRunLock, runTitle, verifyExe } from './lib/run.mjs';
+import {
+  acquireRunLock, archiveShots, prepareOverlay, releaseRunLock, runTitle, verifyExe, waitForNoRuns,
+} from './lib/run.mjs';
 import { parseLog, reachedWorld } from './lib/logparse.mjs';
 import { copyTemplate } from './lib/datatemplate.mjs';
 import { compile, counts, describe, toKeys } from './lib/schedule.mjs';
@@ -73,7 +75,10 @@ if (settings.dataTemplate) {
   log('no save template is set: the run starts at the title\'s first setup');
 }
 
+// Made before the run starts: the layer writes a frame into it and says so in the log
+// when it cannot, which is one line per frame for a folder that was never made.
 const captureDir = join(dir, 'shots-raw');
+mkdirSync(captureDir, { recursive: true });
 const switches = { ...opt.env };
 if (!settings.noKeys) {
   const events = compile(settings.keys);
@@ -84,9 +89,23 @@ if (!settings.noKeys) {
   }
 }
 
+// Nothing of a run is up before the lock is asked for, and nothing is up after it was
+// taken: the second look is what a lock shared with someone else's settings cannot do.
+const before = await waitForNoRuns(settings, { log });
+if (!before.clear) {
+  console.error('a run of the title is up and did not go away; not starting a second one');
+  process.exit(1);
+}
+
 const lock = await acquireRunLock(settings.paths.lock, 'kira-harness/' + opt.id, { log });
 if (!lock.acquired) {
   console.error('the run lock could not be taken; another run is going');
+  process.exit(1);
+}
+const again = await waitForNoRuns(settings, { log });
+if (!again.clear) {
+  releaseRunLock(lock);
+  console.error('a run of the title is up beside this one; letting the lock go');
   process.exit(1);
 }
 let run;

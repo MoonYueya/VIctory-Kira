@@ -181,6 +181,46 @@ slots the title **asks for**, and the warning that would show slots going past t
 never fired. What the runs do show is 2.1% of material slots only partly uploaded — a
 candidate, not a proven cause. The account of the missing skin itself is in the issue below.
 
+### Where the texture shortage comes from, and what moves it (3 runs, 480 s each)
+
+Three runs of one build with one switch changed at a time, one cache shared between them
+(a cold run translates over two thousand shaders and builds thousands of pipelines first,
+so its first minute is not the run being compared). The card is 10 GB; the system's budget
+for it moved between 9,283 MB and 4,850 MB during a single run, thirty-five times.
+
+The texture queue refuses a texture it has not made yet when
+"used < budget × room percent" is false (`crates/victory-gpu/src/resource.rs`: the
+	exttt{room} function, nine tenths of the budget by default). On this card the budget falls
+below the use often enough that the refusal is what a world full of missing texture is made
+of, not space itself.
+
+| | default (90 %) | `VICTORY_TEXTURE_ROOM_PERCENT=97` | `VICTORY_CARD_ROOM_FOR_TARGETS_MB=1024` |
+|---|---|---|---|
+| world frames / median frame | 75 / 364.8 ms | 75 / 371.4 ms | 72 / 386.8 ms |
+| textures uploaded (total) | 65,569 (3,692 MB) | **78,940 (4,331 MB)** | 63,008 (3,560 MB) |
+| slots passed over, unmapped | 13,608 | **11,173 (-17.9 %)** | 14,083 (+3.5 %) |
+| texture slots sampled, full | 49 of 51 (96.1 %) | **66 of 67 (98.5 %)** | 83 of 105 (79.1 %) |
+| lowest single slot | 58.1 % of its bytes | **74.9 %** | 52.4 % |
+| frame picture, mean / sd | 62.8 / 49.1 | 63.4 / 49.2 | 69.2 / 51.7 |
+| black frames | 5 of 274 | 6 of 253 | 0 of 136 |
+
+What it says:
+- **The textures that are there are complete.** Ninety-six to ninety-eight per cent of the
+  slots sampled have every byte of their memory mapped; the missing ones are textures not
+  made at all, not textures half sent.
+- **Giving the texture queue a larger share helps** and costs nothing measurable: a fifth
+  more textures up, a sixth fewer slots passed over, complete slots from 96 % to 98.5 %,
+  frame time and picture within noise.
+- **Taking room away from render targets makes it worse**: the slots sampled that are
+  complete fall to 79 %, more slots are passed over, and the frame is 6 % slower. A render
+  target refused the card reads over the bus instead, which is the same road the textures
+  use.
+
+Not measured here: whether the visible skin returns with the larger share (the sampled
+slots say the shaders' textures are complete, but the picture was not read back for a
+face). A fence-gated LRU of cached textures (avatarmanz/VIctory-7900XTX pull request #72)
+is the structural form of the same fix and is not in this tree.
+
 ### Filed upstream
 
 Written up as avatarmanz/VIctory-7900XTX

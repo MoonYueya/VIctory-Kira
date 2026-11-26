@@ -71,6 +71,26 @@ export function loadSettings(explicit) {
     noKeys: raw.noKeys === true,
     /** Stop the run as soon as the log shows a world frame instead of waiting it out. */
     stopOnWorld: raw.stopOnWorld !== false,
+    /**
+     * One cache directory kept across runs (shaders, pipelines, images), or null for a
+     * fresh one inside `work` per run.
+     *
+     * Shared on purpose: the title's shader library and the driver's own cache are what
+     * make a run warm, and a new folder every time throws both away — a cold run
+     * translates over a thousand shaders and builds thousands of pipelines, which is
+     * minutes of a run and a different frame rate from the one being compared. Only one
+     * run may write it at a time (the run lock sees to that).
+     */
+    cacheDir: expand(raw.cacheDir),
+    /**
+     * The file one run takes so that no second run of the title starts beside it.
+     *
+     * `lock` in the settings, else one at the scratch root — the folder `work` names is
+     * shared, not a run's own — so that two people (or two builds) pointed at one machine
+     * wait for each other whatever each calls its own `work`. A lock inside a per-run
+     * folder is no lock at all: both sides take theirs and both start the title.
+     */
+    lockFile: expand(raw.lock),
   };
   const paths = {
     work: settings.work,
@@ -78,9 +98,9 @@ export function loadSettings(explicit) {
     temp: join(settings.work, 'temp'),
     runs: join(settings.work, 'runs'),
     overlay: join(settings.work, 'overlay'),
-    cache: join(settings.work, 'cache'),
+    cache: settings.cacheDir || join(settings.work, 'cache'),
     data: join(settings.work, 'data'),
-    lock: join(settings.work, 'RUN.lock'),
+    lock: settings.lockFile || resolve(settings.work, '..', 'RUN.lock'),
   };
   return { ...settings, paths };
 }

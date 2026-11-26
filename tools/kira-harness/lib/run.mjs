@@ -65,6 +65,67 @@ export function releaseRunLock(lock) {
   return true;
 }
 
+// --------------------------------------------------------- is one already running
+
+/**
+ * The processes of a run that are up now: the layer's own (`victory.exe`) and the
+ * title's executable (`peat` in these settings).
+ *
+ * A lock file is only as good as everyone honouring the same path. This is the check
+ * behind it: two runs of the title at once is what the lock exists to prevent, and one
+ * that started before the lock was shared (or before this line existed) is still found
+ * here — the title's folder is the same one whatever `work` a run calls its own.
+ */
+export function runsUp(settings) {
+  const wanted = new Set();
+  for (const p of [settings.victory, settings.exe]) {
+    if (p) wanted.add(basename(p).toLowerCase());
+  }
+  wanted.add('victory.exe');
+  let text = '';
+  try {
+    text = execFileSync('tasklist', ['/FO', 'CSV', '/NH'], {
+      encoding: 'utf8', windowsHide: true, timeout: 30000,
+    });
+  } catch {
+    return null; // cannot tell: the caller decides (it waits, and says so)
+  }
+  const found = [];
+  for (const line of text.split(/\r?\n/)) {
+    const name = (line.split('","')[0] || '').replace(/^"/, '').toLowerCase();
+    if (name && wanted.has(name)) found.push(name);
+  }
+  return [...new Set(found)];
+}
+
+/**
+ * Wait until nothing of a run is up, then say so: every `check` ms for up to `limitMs`.
+ *
+ * Called before the lock is taken and again after: the first wait keeps this run from
+ * queueing on a lock a stale process is holding, the second covers the moment between
+ * the lock and the title's start, which is where two runs slipped past each other.
+ */
+export async function waitForNoRuns(settings, { checkMs = 30000, limitMs = 40 * 60 * 1000, log = () => {} } = {}) {
+  const began = Date.now();
+  let told = false;
+  for (;;) {
+    const up = runsUp(settings);
+    if (up && up.length === 0) return { clear: true, waitedMs: Date.now() - began };
+    if (up === null && !told) {
+      log('cannot list the processes here: going on, the lock is all there is');
+      return { clear: false, waitedMs: Date.now() - began };
+    }
+    if (Date.now() - began > limitMs) {
+      return { clear: false, waitedMs: Date.now() - began, up };
+    }
+    if (!told) {
+      log('a run is up (' + up.join(', ') + '): waiting for it, ' + Math.round(checkMs / 1000) + ' s a look');
+      told = true;
+    }
+    await sleep(checkMs);
+  }
+}
+
 // ------------------------------------------------------------------ the title's folder
 
 /**
@@ -161,7 +222,10 @@ export async function runTitle(settings, {
   onTick = null, tickMs = 2000, shouldStop = null,
 } = {}) {
   const exeInOverlay = await placeExeInOverlay(settings.exe, settings.paths.overlay, { log });
-  const cacheDir = join(settings.paths.cache, 'images');
+  // The whole cache directory, and not a folder of images inside it: the title's
+  // translated shaders and the pipeline library live beside the images, and it is
+  // those two that make a run warm.
+  const cacheDir = settings.paths.cache;
   mkdirSync(dirname(logPath), { recursive: true });
   mkdirSync(cacheDir, { recursive: true });
   mkdirSync(dataDir, { recursive: true });
