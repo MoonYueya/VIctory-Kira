@@ -1030,6 +1030,24 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+#[cfg(test)]
+impl Host {
+    /// A host of the test's own device, queue and fence: the recording and
+    /// submission side of one, without a title.
+    pub(crate) fn made_for_test(device: ID3D12Device, queue: ID3D12CommandQueue, fence: ID3D12Fence, event: HANDLE) -> Option<Host> {
+        Some(Host {
+            device,
+            queue,
+            fence,
+            submitted: Mutex::new(0),
+            event,
+            messages: None,
+            presenter: Mutex::new(None),
+            adapter: None,
+        })
+    }
+}
+
 impl Host {
     /// The driver's version, as the system counts it (0: not known).
     pub(crate) fn driver(&self) -> i64 {
@@ -2419,6 +2437,17 @@ struct Deferred {
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
+    /// Ranges given to shaders of a copy that is the title's own memory
+    /// ([\`Shadow::direct_read\`], \`VICTORY_UMA_DIRECT=1\`): nothing is refreshed
+    /// into it, and this is what the submission still has to know about them.
+    /// By the copy's number: the copy, from, to. (\`blocked_by\` and the
+    /// submission's own wait read it: a flight's shaders that may write such
+    /// a range have to be waited for, as for a refresh.)
+    direct: ByCopy<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Such ranges given in this recording: the count and the bytes, for the
+    /// diagnostic line (\`inplace::say\`).
+    direct_requests: u64,
+    direct_bytes: u64,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2444,7 +2473,32 @@ struct Deferred {
     indirect_readable: usize,
 }
 
+#[cfg(test)]
 impl Deferred {
+    /// Where `shadow`'s range is in \`direct\`, if it is: from, to.
+    pub(crate) fn direct_span(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) -> Option<(usize, usize)> {
+        self.direct.get(&(shadow.id() as usize)).map(|&(_, from, to)| (from, to))
+    }
+
+    /// How many steps the list recorded (refreshes among them).
+    pub(crate) fn steps(&self) -> usize {
+        self.copies.len()
+    }
+}
+
+impl Deferred {
+    /// `bytes` at `at` of a copy that is the title's own memory are given to
+    /// the list's shaders: nothing is refreshed into it, and the range is
+    /// kept for the submission's wait ([\`blocked_by\`]).
+    fn direct_read(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, at: usize, bytes: usize) {
+        let end = at + bytes;
+        let span = self.direct.entry(shadow.id() as usize).or_insert_with(|| (shadow.clone(), at, end));
+        span.1 = span.1.min(at);
+        span.2 = span.2.max(end);
+        self.direct_requests += 1;
+        self.direct_bytes += bytes as u64;
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -3171,7 +3225,18 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     // Destinations of copies at their place, if a step reads them.
     let mut placed: Vec<(usize, usize)> = Vec::new();
     for list in runs {
-        for step in &list.deferred().copies {
+        let recording = list.deferred();
+        // Ranges of the title's own memory given to the list's shaders
+        // ([\`Shadow::direct_read\`]): a flight's shaders that may write them
+        // are waited for, exactly as for a refresh — nothing was refreshed
+        // into them, so what they read is the title's bytes as they were
+        // when the flight started, and a flight that writes them may be
+        // seen half done. Conservative on purpose: it may wait more than
+        // the copy would have needed.
+        if recording.direct.values().any(|&(_, from, to)| touches(written, from, to)) {
+            return Some(WHY_READ);
+        }
+        for step in &recording.copies {
             match step {
                 &Step::Copy(dst, src, len) => {
                     if let Some(_read) = copy_blocked(written, dst, src, len) {
@@ -7061,6 +7126,7 @@ impl HostList {
         {
             let deferred = self.deferred();
             if !(deferred.copies.is_empty()
+                && deferred.direct.is_empty()
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
@@ -7182,6 +7248,12 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
+        // The title's own memory, read by the shaders themselves: there is
+        // nothing to bring up to date ([\`Shadow::direct_read\`]).
+        if shadow.direct_read() {
+            deferred.direct_read(shadow, address, len);
+            return;
+        }
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             deferred
@@ -7573,6 +7645,14 @@ impl HostList {
         let (mut us, mut bytes) = (std::time::Duration::ZERO, 0u64);
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
+        // What `VICTORY_UMA_DIRECT` kept out of `copies`: the diagnostic line
+        // (`inplace::say`) counts them, nothing here does.
+        {
+            let recording = self.deferred();
+            if recording.direct_requests != 0 {
+                crate::inplace::skipped(recording.direct_requests, recording.direct_bytes);
+            }
+        }
         for (i, step) in self.deferred().copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
@@ -11160,6 +11240,97 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(band, RamBand::Watch);
         band = ram_band(band, 3857 * M, 7800 * M, 15900 * M, 3962 * M, 32 * 1024 * M, 11 * 1024 * M);
         assert_eq!(band, RamBand::Watch);
+    }
+
+    /// `VICTORY_UMA_DIRECT=1`: a range of a copy that is the title's own
+    /// memory is recorded as a direct read and no refresh step is made for
+    /// it; a copy shaders were declared to write keeps the old path, and so
+    /// does every copy with the switch off.
+    #[test]
+    fn a_direct_read_of_placed_memory_makes_no_refresh_step() {
+        const LEN: usize = 0x1_0000;
+        let on = crate::inplace::direct_on();
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(host) = crate::inplace::tests::warp_host() else { return };
+        let backing = vec![0u8; LEN];
+        let copy = crate::shadow::Shadow::unbacked(0x8_0000_0000, backing.as_ptr() as *mut u8, LEN as u64, false);
+        let placed = crate::shadow::Shadow::placed_unbacked(0x7_0000_0000, LEN as u64, false, 0);
+        assert!(!copy.direct_read(), "a host copy is never direct");
+        assert_eq!(placed.direct_read(), on, "in place and unwritten: the switch alone says");
+        // The old path: one refresh step, nothing direct. (A list of its own
+        // for each case: a list is not reset here, and a closed list is what
+        // a submission wants.)
+        let list = host.new_list().expect("a list");
+        copy.refresh(&list, 0x8_0000_0000, LEN as u64);
+        assert_eq!(list.deferred().steps(), 1, "a host copy is refreshed");
+        assert!(list.deferred().direct_span(&copy).is_none(), "and nothing is noted as direct");
+        // Placed: a step with the switch off (as today), a direct range with it on.
+        let listing = host.new_list().expect("a list");
+        placed.refresh(&listing, 0x7_0000_0000, LEN as u64);
+        assert_eq!(listing.deferred().steps(), usize::from(!on), "placed: nothing is copied, so nothing is recorded");
+        assert_eq!(listing.deferred().direct_span(&placed).is_some(), on, "the range is kept for the wait");
+        // Shaders write it: the switch does not reach a written copy.
+        let written = crate::shadow::Shadow::placed_unbacked(0x9_0000_0000, LEN as u64, true, 0);
+        let writes = host.new_list().expect("a list");
+        written.gpu_writes(&writes, 0x9_0000_0000, LEN as u64);
+        written.refresh(&writes, 0x9_0000_0000, LEN as u64);
+        assert_eq!(writes.deferred().steps(), 1, "a written copy keeps the old path");
+        assert!(writes.deferred().direct_span(&written).is_none(), "and is never direct");
+    }
+
+    /// A copy placed over title memory that is not on a 64 KiB line sits at
+    /// an offset in its buffer (`Shadow::offset`): what the shaders address
+    /// is the title's address, and a direct read is noted in the title's
+    /// addresses — so the range that is kept is the one a flight is asked
+    /// about, and it is the title's own, not the heap's. After a view is
+    /// remapped the buffer is a new one at a new offset, and the copy's
+    /// ranges follow it.
+    #[test]
+    fn a_direct_read_keeps_the_titles_addresses_across_a_remap() {
+        const LEN: usize = 0x1_0000;
+        let bias = 0x1230;
+        let start = 0x7_0000_0000u64;
+        let placed = crate::shadow::Shadow::placed_unbacked(start, LEN as u64, false, bias);
+        // A buffer that begins 0x1230 bytes before the title's first byte:
+        // the shaders' address of the title's byte 0 is the buffer's 0x1230.
+        assert_eq!(placed.offset(start), bias);
+        assert_eq!(placed.offset(start + 0x100), bias + 0x100);
+        // The range noted is the title's, whatever the bias.
+        let mut deferred = super::Deferred::default();
+        deferred.direct_read(&placed, start as usize, LEN);
+        assert_eq!(deferred.direct_span(&placed), Some((start as usize, start as usize + LEN)));
+        // The same copy at a new offset (a remap on the same pages): the
+        // buffer's addresses move, the title's do not, and what is noted of
+        // it stays the title's.
+        let remapped = crate::shadow::Shadow::placed_unbacked(start, LEN as u64, false, 0);
+        assert_eq!(remapped.offset(start), 0);
+        let mut after = super::Deferred::default();
+        after.direct_read(&remapped, start as usize, LEN);
+        assert_eq!(after.direct_span(&remapped), Some((start as usize, start as usize + LEN)));
+    }
+
+    /// With `VICTORY_UMA_DIRECT=1`: a flight's shaders that may write a
+    /// range a list's shaders read directly stop the submission, exactly as
+    /// they would for a refreshed range. A range they do not touch does not.
+    #[test]
+    fn a_direct_read_waits_for_a_flight_that_may_write_it() {
+        const LEN: usize = 0x1_0000;
+        if !crate::inplace::direct_on() {
+            return;
+        }
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(host) = crate::inplace::tests::warp_host() else { return };
+        let placed = crate::shadow::Shadow::placed_unbacked(0x7_0000_0000, LEN as u64, false, 0);
+        let list = host.new_list().expect("a list");
+        placed.refresh(&list, 0x7_0000_0000, LEN as u64);
+        assert_eq!(list.deferred().direct_span(&placed), Some((0x7_0000_0000, 0x7_0000_0000 + LEN)));
+        let runs = [&list];
+        // A flight's shaders write inside it.
+        assert_eq!(super::blocked_by(&[(0x7_0000_0000 + 64, 0x7_0000_0000 + 128)], &runs, false), Some(super::WHY_READ));
+        // And outside it: nothing is waited for.
+        assert_eq!(super::blocked_by(&[(0x7_0000_0000 + LEN + 64, 0x7_0000_0000 + LEN + 128)], &runs, false), None);
+        // The write counts in the list as work: it is not an untouched list.
+        assert!(!list.untouched(), "a direct read is a read the submission must keep");
     }
 
     #[test]

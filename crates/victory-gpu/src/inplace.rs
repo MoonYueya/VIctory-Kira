@@ -89,6 +89,55 @@ pub(crate) fn level() -> u8 {
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
+/// `VICTORY_UMA_DIRECT`: 0 (unset) off, 1 on. A copy that is the title's
+/// own memory and that no shader writes ([`crate::shadow::Shadow::direct_read`])
+/// is not refreshed: the refresh would copy nothing (`Shadow::update`), and
+/// the step, the thread time and the write-watch asking it costs are what
+/// is skipped. Off by default: it changes which ranges a submission's
+/// flights wait on ([`crate::host`] `blocked_by`), which no run on a card has
+/// measured yet.
+///
+/// What it needs to be worth anything: `VICTORY_INPLACE` at 1 (windows) or
+/// 2 (title buffers too) — with the level at 0 nothing is placed, so nothing
+/// is ever direct and the path is as it was.
+///
+/// What it changes for the other switches:
+/// - `VICTORY_LATE_WAIT`: what placed copies are *read* through is now told
+///   per submission, so a flight whose shaders may write those ranges is
+///   waited for on their account (`blocked_by`), as it is for a refresh.
+///   This is the read side, and it is what the switch adds.
+/// - `VICTORY_INPLACE=2` + `VICTORY_LATE_WAIT`: still not to be combined,
+///   and this switch does not change that. That document's warning (see
+///   [`level`]) is about the *write* side: `Shadow::gpu_writes` declares
+///   nothing to the flights for a placed copy (it returns before
+///   `defer_gpu_write`), so a submission whose shaders write title memory
+///   through a placed buffer is in no flight's written set, and a later
+///   submission's `blocked_by` cannot see it. Told apart: the reads are
+///   covered here, the writes are not — hence the prohibition stands.
+/// - Port 6 (`VICTORY_PORT_GUARD`, the guarded write-watch): what is direct
+///   never reaches it, so its counters fall by that much; read them against
+///   a run with this switch off before calling Port 6 weaker.
+/// - window copies (`Shadow::window_use`): a placed window is not copied
+///   at all (`VICTORY_INPLACE=1`); the copy a window keeps when it is not
+///   placed is untouched by this switch.
+/// - `VICTORY_FENCE_WAKE`: nothing. No fence, no wait and no event is
+///   changed here.
+pub(crate) fn direct_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UMA_DIRECT").is_some_and(|v| v == "1"))
+}
+
+/// What `VICTORY_UMA_DIRECT` skipped: refresh requests and their bytes, from
+/// the start ([`HostList::defer_refresh`](crate::host)).
+static SKIPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// `requests` refreshes of `bytes` were not needed: the copies they name are
+/// the title's own memory ([crate::shadow::Shadow::direct_read]).
+pub(crate) fn skipped(requests: u64, bytes: u64) {
+    SKIPPED[0].fetch_add(requests, Ordering::Relaxed);
+    SKIPPED[1].fetch_add(bytes, Ordering::Relaxed);
+}
+
 /// The most title memory in place at once, in bytes
 /// (`VICTORY_INPLACE_MB`, 4096): opening locks the pages into the PC's
 /// memory, also those the title never touched.
@@ -209,6 +258,14 @@ fn say() {
         s[6],
         s[7]
     );
+    if direct_on() {
+        let k: Vec<u64> = SKIPPED.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+        tracing::info!(
+            "title memory read directly (VICTORY_UMA_DIRECT=1): {} refreshes skipped, {} MB; nothing was copied into them",
+            k[0],
+            k[1] >> 20
+        );
+    }
 }
 
 /// What a heap is opened on.
@@ -1219,7 +1276,7 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 /// census (on a thread of its own: it asks Windows about every copy) 30
 /// and 150 seconds later.
 pub(crate) fn tick() {
-    if level() > 0 {
+    if level() > 0 || direct_on() {
         say();
     }
     if probe_level() == 0 {
@@ -1351,6 +1408,21 @@ pub(crate) mod tests {
             mem::VirtualProtect(base.cast(), K64, mem::PAGE_READONLY, &mut old);
             assert!(!private_whole(base as usize, 2 * K64), "a guarded page");
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// A host of ours on the software adapter, for the tests that record
+    /// into a list without a title (`crate::host`'s direct-read test).
+    pub(crate) fn warp_host() -> Option<crate::host::Host> {
+        let device = warp()?;
+        // SAFETY: plain object creation on the software adapter; the handle
+        // is the host's now and the process ends with the test.
+        unsafe {
+            let queue: ID3D12CommandQueue =
+                device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            let event = CreateEventW(None, false, false, None).ok()?;
+            crate::host::Host::made_for_test(device, queue, fence, event)
         }
     }
 
