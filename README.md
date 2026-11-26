@@ -1,3 +1,36 @@
+# VIctory-Kira: VIctory on NVIDIA (RTX 3080)
+
+> **This is the NVIDIA branch** (`MoonYueya/VIctory-Kira`), based on
+> [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) at
+> `e2a28ec`, itself a fork of [VIctory](https://github.com/Marvisak/VIctory).
+> It is aimed at 32-lane NVIDIA hardware (tested on an **RTX 3080 10 GB**) and
+> **contains no game files, code or assets** — you need your own copy of the
+> game. Not affiliated with or endorsed by the game's developer or publisher.
+>
+> Open pull requests from upstream are merged here on top of that base, each as a
+> `--no-ff` merge so its author stays in the history:
+>
+> | PR | Author | What it changes |
+> |---|---|---|
+> | [#42](https://github.com/avatarmanz/VIctory-7900XTX/pull/42) | gomeaw | Render and depth descriptor scratch is private to each recording thread |
+> | [#66](https://github.com/avatarmanz/VIctory-7900XTX/pull/66) | Mumogg | wave64 builder programs count threads on 32-lane hosts |
+> | [#18](https://github.com/avatarmanz/VIctory-7900XTX/pull/18) | gomeaw | Unique compute thread IDs on tiled wave32 GPUs |
+> | [#10](https://github.com/avatarmanz/VIctory-7900XTX/pull/10) | gomeaw | Wide indirect dispatches split on 32-lane GPUs |
+> | [#4](https://github.com/avatarmanz/VIctory-7900XTX/pull/4) | gomeaw | LDS flag regions run on 32-lane GPUs |
+> | [#58](https://github.com/avatarmanz/VIctory-7900XTX/pull/58) | battledogegames-design | Direct-heap root-signature flags from shader features |
+> | [#17](https://github.com/avatarmanz/VIctory-7900XTX/pull/17) | UwUCammie | A frame is counted after DXGI accepts the present |
+>
+> Our own commits on top: `a738c22` (GameInput reports the scripted keys as a
+> stand-in pad in slot 0 when no controller is attached) and `bbcdb0a` (the
+> dynamic descriptor region is sized by where the title's heap ends on NVIDIA).
+>
+> Build it with `cargo build --profile diag -p victory --features diagnostics`.
+> The plain default build has frame capture and scripted keys compiled out, and a
+> run of it never leaves the menu.
+>
+> Tests on this branch: **936 passed, 0 failed, 45 ignored**. Every merge above
+> was built and tested on its own and kept the count at or above the one before.
+
 # VIctory on an RX 7900 XTX
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
