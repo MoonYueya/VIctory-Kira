@@ -1419,6 +1419,30 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// The highest view slot the title's own heap reaches in the retail game: it
+/// asks for 1,245,184 slots ("host view heap capped at 1000000") but reads up
+/// to about 720,000 - the count above says 720,000, and `mirror`'s "title slot
+/// past the host heap" warning counts any slot past the host's and stays at 0
+/// when this holds (XTX-R1: 0 in every run). On a host whose view heaps are
+/// capped at [`PORTABLE_VIEWS`] (NVIDIA) the title's slots and the dynamic
+/// ones share that one cap, so the dynamic region may take what lies past
+/// this one and no more.
+const TITLE_REACH: u32 = 720_000;
+
+/// [`TITLE_REACH`], or `VICTORY_TITLE_REACH` (a whole number of slots: the run
+/// that measures where the title's heap really ends sets it, so the dynamic
+/// region can be moved up or down without a build; a value the heap cannot
+/// hold is clamped below).
+fn title_reach() -> u32 {
+    static REACH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *REACH.get_or_init(|| {
+        std::env::var("VICTORY_TITLE_REACH")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(TITLE_REACH)
+            .clamp(DYNAMIC, PORTABLE_VIEWS - 1)
+    })
+}
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
@@ -1433,8 +1457,40 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(DYNAMIC << 2)
     });
+    let reach = title_reach();
+    let slots = dynamic_slots_within(count, null, most, reach);
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        // What the title's own heap keeps is what the dynamic region leaves:
+        // the acceptance check is `mirror`'s "title slot past the host heap",
+        // which stays at 0 as long as this is at or past the title's highest.
+        tracing::info!(
+            asked = count,
+            reach,
+            dynamic = slots,
+            title_slots = null.saturating_sub(slots),
+            "view heap capped at {null} slots: the title's slots and {slots} dynamic ones"
+        );
+    }
+    slots
+}
+
+/// [`dynamic_slots`] with the most it may take given (`VICTORY_DYNAMIC_SLOTS`).
+///
+/// A capped host heap (NVIDIA) takes its views in two: the title's slots, then
+/// the dynamic ones, then the null slot. The title's `count` does not fit at
+/// all there, so the old early return pinned the region at `DYNAMIC` and
+/// ignored `VICTORY_DYNAMIC_SLOTS` entirely: 2^18 ran out on an RTX 3080
+/// (XTX-R1, run A: 774,254 tables asked, 120,350 refused, 1,880 in one frame).
+/// What the title cannot reach is the room above [`TITLE_REACH`], so that is
+/// what the dynamic region may take, however many slots the title asks for.
+/// The title's own slots stay whole: the returned region is the only part of
+/// the heap that moves.
+fn dynamic_slots_within(count: u32, null: u32, most: u32, reach: u32) -> u32 {
+    if null < PORTABLE_VIEWS {
+        // Past `reach` + 1 so that the title's highest slot is still a title
+        // slot: a heap of `fitted` slots ends at `fitted - 1`.
+        let room = null.saturating_sub(reach.saturating_add(1));
+        return room.min(most).max(DYNAMIC);
     }
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
@@ -5408,6 +5464,38 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// A capped host heap (NVIDIA, 1,000,000 views) no longer pins the dynamic
+    /// region at 2^18 whatever it is asked: it takes the room above where the
+    /// title's own heap ends, and `VICTORY_DYNAMIC_SLOTS` is honoured there.
+    #[test]
+    fn a_capped_heap_gives_the_dynamic_region_the_room_the_title_cannot_reach() {
+        let null = PORTABLE_VIEWS - 1;
+        // 999,999 - (720,000 + 1) = 279,998, more than 2^18 = 262,144.
+        assert_eq!(dynamic_slots_within(1_245_184, null, DYNAMIC << 2, TITLE_REACH), 279_998);
+        // The title's highest slot is still a title slot: 999,999 - 279,998 - 1
+        // is the last title slot, past 720,000.
+        assert!(null - 279_998 >= TITLE_REACH);
+        // VICTORY_DYNAMIC_SLOTS is honoured in both directions, above and below.
+        assert_eq!(dynamic_slots_within(1_245_184, null, 400_000, TITLE_REACH), 279_998);
+        assert_eq!(dynamic_slots_within(1_245_184, null, 300_000, TITLE_REACH), 279_998);
+        assert_eq!(dynamic_slots_within(1_245_184, null, 270_000, TITLE_REACH), 270_000);
+        // Never below 2^18: the region the dynamic tables need at the least.
+        assert_eq!(dynamic_slots_within(1_245_184, null, 1, TITLE_REACH), DYNAMIC);
+        // A reach close to the cap leaves only the floor, not a negative.
+        assert_eq!(dynamic_slots_within(1_245_184, null, DYNAMIC << 2, null - 1), DYNAMIC);
+        assert_eq!(dynamic_slots_within(1_245_184, null, DYNAMIC << 2, 500_000), null - 500_001);
+        // A capped host has no room above its cap whatever the title asks for,
+        // so a title that asks for little gets the same region: the title's
+        // own slots come first, and it never asked for more than they hold.
+        assert_eq!(dynamic_slots_within(1000, null, DYNAMIC << 2, TITLE_REACH), 279_998);
+        assert_eq!(dynamic_slots_within(1, null, DYNAMIC << 2, TITLE_REACH), 279_998);
+        // An uncapped host (AMD) is untouched: four times the floor at most.
+        assert_eq!(
+            dynamic_slots_within(1_245_184, UNCAPPED_VIEWS - 1, DYNAMIC << 2, TITLE_REACH),
+            (UNCAPPED_VIEWS - 1) - 1_245_184
+        );
     }
 
     #[test]
