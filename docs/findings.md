@@ -227,3 +227,42 @@ Written up as avatarmanz/VIctory-7900XTX
 [#75](https://github.com/avatarmanz/VIctory-7900XTX/issues/75). The dynamic-slot
 exhaustion was already filed there as #35 by someone else on an RTX 5080; the numbers above
 are an independent reproduction, not a new report.
+
+### Performance and memory baseline, 2026-11-26
+
+Two unattended runs of the same build, the same switch set and the same warm cache, 480 s
+each, reaching the world and stopping there: 78 and 75 one-second frame lines. What they
+say about a world frame (median; the two runs differed by under 5 % everywhere below):
+
+| | run 1 | run 2 |
+|---|---|---|
+| Frame | 355 ms | 362 ms |
+| On the GPU | 85 ms | 88 ms |
+| Preparing (title-memory copies and textures) | 43 ms | 44 ms |
+| Copying back | 36 ms | 36 ms |
+| **The card with nothing of ours queued** | **138 ms** | **140 ms** |
+| The card busy, by that count | 60 % | 61 % |
+| draws per frame | 4,809 | 4,881 |
+
+**The card is idle about 38 % of every frame, and almost none of that is us working while
+it waits** (21.7 and 22.2 ms of it): the title has not submitted. Of the 4,809 draws a frame,
+the submitting thread spends 2,056 ms a frame in 41,663 list calls, and 90 ms waiting for
+the submission lock. A world frame costs 355 ms while the GPU is asked for 85.
+
+**Memory is over the budget the whole time.** The card held 8,967 and 8,719 MB against a
+budget that DXGI gave as 7,602 and 7,473 MB; 481 and 491 passes made no texture for lack of
+room, and 9,962 and 10,194 textures a frame were passed over unmapped. Host copies let go
+during the runs: 36,458 and 33,700 (1,993 and 1,632 MB). Free physical memory at the end:
+665 and 546 MB of 31.1 GB, with 4.5 GB of title-window copies and 2.8 GB of texture host
+copies held in system memory.
+
+**What this says about where to look next.** Shader work is not the first thing to try: the
+GPU has a quarter of the frame and the card is idle for a third of it. The first is what the
+title and the layer do between submissions; the second is the memory budget. A switch for
+submitting off the title's thread already exists here (`VICTORY_ASYNC_SUBMIT`, off by
+default) and lines up with the first; nothing in this tree does least-recently-used
+eviction of card memory, which lines up with the second.
+
+Two earlier runs of this build were thrown away: one ran while another build of the layer
+was playing on the same card, and one used a shader cache that the other build had written
+to. Both are excluded above, and neither is a number in this note.
