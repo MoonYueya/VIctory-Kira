@@ -428,3 +428,61 @@ no sweep line, and the live window copies were under the cap. Its band only acts
 system RAM is under pressure, and this host had 22 GB free, so the run is a
 control-equivalent, not a measurement of the cap.
 
+
+### Where the 8.9 GB the card holds actually goes, by class, 2026-11-26 (`1c67de7`)
+
+One unattended 480 s run into the world (`vram-ctl`), the `scripts/play.ps1` switch set plus
+`VICTORY_MEMORY_CATEGORIES=1` and a new opt-in ledger (`VICTORY_VRAM_LEDGER=1`,
+`crates/victory-gpu/src/vram.rs`): 67 world frames, no device removal, no panic, median world
+frame 450.9 ms. The ledger counts live bytes, ending when the resource does (a small COM object
+in the resource's private data, the way `book` does it), because the caller keeps the resource
+for as long as the title or a list names it.
+
+| What holds card memory | median MB | peak MB | things |
+|---|---|---|---|
+| in use, as the system counts it | **8,905** | 8,960 | — |
+| DXGI local budget | 7,644 | 7,964 | — |
+| of the budget | **116 %** | — | — |
+| title textures the title fills | 1,582 | 2,268 | 19,452 |
+| render targets and unordered-access textures | 2,823 | 2,823 | 723 |
+| blocks of texture memory, whole | 3,136 | 3,136 | 49 |
+| card sides of title buffers | 492 | 492 | 10 |
+| card sides of windows | 0 | 0 | 0 |
+| card memory the CPU maps | 0 | 0 | 0 |
+| unordered-access and scratch buffers | 592 | 624 | 4,211 |
+| accounted | 5,498 | 5,641 | |
+| **unaccounted** | **3,420** | 3,442 | |
+| the PC's memory the CPU maps (not counted above) | 5,819 | 5,973 | 10,763 |
+
+What it says, and what it does not:
+
+- **The card is 1,262 MB over the budget the system gives it**, which is the condition the
+  texture queue's admission test is asked under.
+- **The largest single item is the block pool, and most of it was empty.** 49 blocks of 64 MiB
+  are 3,136 MB; the textures cut from them held about 1,578 MB, so roughly 1.5 GB was blocks
+  kept with nothing in them. `pool.rs` keeps up to 64 empty blocks (4 GiB) while the card is
+  under 85 % of its budget. No run has yet been made with that lowered.
+- **A piece inside a block has no card memory of its own.** The first version of this line
+  counted the blocks whole *and* the pieces in them, which counted the same 1,578 MB twice;
+  the numbers above are from that version and its `accounted` is too high by that much. The
+  arithmetic is fixed (blocks whole, textures only outside them) and not yet re-measured.
+- **The buffer copies and the scratch buffers are the movable part, and they are small**:
+  492 MB of card sides of title buffers and 592 MB of unordered-access scratch, against
+  4,405 MB of the title's own textures and render targets, which cannot be moved anywhere.
+  Every one of the movable classes answers to an existing switch; the plan table is in
+  `VIctory-Kira-reports/VK-VRAM-MIX-1-2026-11-26.md` (outside this repository).
+- **The unaccounted 3.4 GB is the driver's own account** — command allocators, pipeline
+  objects, the pipeline library's mapped file (217 MB in this run), descriptor heaps (56 MB),
+  and allocations no call of ours can see. It is printed as a difference rather than explained.
+
+**One A/B was attempted and is void.** `VICTORY_CARD_BUFFERS=0` was run against the same
+switch set, and the process died at 166 s with `0xC0000409`: `memory allocation of 3686400
+bytes failed`, with `private 79777 MB ... the PC has 1113 MB free and 644 MB left to commit`
+on a 31.1 GB machine. That is the process running out of **system** memory, not of card
+memory, and it is not attributable to the switch; the run is not a measurement and no
+comparison is drawn from it. Any longer VRAM experiment on this host has to deal with that
+first.
+
+Fixed by this work: the ledger itself. Not settled: whether lowering the empty-block reserve
+gives the textures the room back without making the pool re-create blocks, and what the
+buffer copies cost in frame time when they are not on the card.
