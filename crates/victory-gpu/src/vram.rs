@@ -281,6 +281,11 @@ pub(crate) const SWITCHES: &[Switch] = &[
         default: "1",
         moves: "textures cut from 64 MiB blocks instead of committed one by one (pool)",
     },
+    Switch {
+        var: "VICTORY_POOL_SPARE",
+        default: "the card's room alone (64 blocks below 85 %, else 2)",
+        moves: "the most 64 MiB blocks of texture memory the pool keeps empty, whatever the card's room says",
+    },
 ];
 /// The ledger's line: what the card holds by class, and how the sum relates
 /// to the number the system gives (`DXGI_QUERY_VIDEO_MEMORY_INFO`).
@@ -313,6 +318,7 @@ pub(crate) fn line() -> String {
     // same card memory twice, so the block's spare part is what stands on
     // its own here, and the pieces are folded into the textures above.
     let (in_blocks, block_count) = crate::pool::held_pieces();
+    let counts = crate::pool::block_counts();
     let block_bytes = block_count << 26;
     let block_spare = block_bytes.saturating_sub(in_blocks);
     let card = crate::host::host()
@@ -344,6 +350,11 @@ pub(crate) fn line() -> String {
         row("pieces taken from the blocks (of the textures above)", in_blocks, 0),
         row("blocks of texture memory, whole", block_bytes, block_count),
         row("  of them empty and kept", block_spare, 0),
+        format!("blocks made in all {}, let go {}", counts[0], counts[1]),
+        // The row above counts the bytes of blocks no piece holds; this one
+        // counts the blocks with nothing in them at all, which is what the
+        // pool may let go: the rest of the former is holes inside blocks.
+        format!("blocks there now {}, of them wholly empty {}", counts[2], counts[3]),
         row(
             "card sides of title buffers",
             own[class::BUFFER_COPY].bytes,

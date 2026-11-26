@@ -32,6 +32,24 @@ const BLOCK: u64 = 64 << 20;
 const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 4 GiB of them.
 const SPARE_KEPT: usize = 64;
+/// `VICTORY_POOL_SPARE`: the most empty blocks either of the two above may
+/// keep, whatever the card's room says (unset or not a number: neither is
+/// lowered, which is what every run before this switch did).
+///
+/// It is the count of 64 MiB blocks of texture memory, not bytes, and not
+/// the staging pool's own limit ([`STAGING_KEPT`] blocks of the PC's
+/// memory): the two are separate pools with separate limits.
+fn spare_most() -> Option<usize> {
+    static MOST: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let raw = std::env::var("VICTORY_POOL_SPARE").ok()?;
+        let most = raw.trim().parse::<usize>().ok();
+        if most.is_none() {
+            tracing::warn!(value = %raw, "VICTORY_POOL_SPARE is not a number of blocks; the card's room alone decides");
+        }
+        most
+    })
+}
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
@@ -97,8 +115,9 @@ impl Ripe {
 
     fn now() -> Ripe {
         let (started, finished) = crate::host::submissions();
-        // Not more than are kept ([`room`]): they would go and be made again.
-        Ripe { started, finished, ahead: ahead().min(SPARES.load(Ordering::Relaxed)) }
+        // Not more than are kept ([`room`], and [`kept`] for the switch):
+        // they would go and be made again.
+        Ripe { started, finished, ahead: ahead().min(kept(usize::MAX)) }
     }
 
     fn is<B>(self, block: &Block<B>) -> bool {
@@ -180,11 +199,15 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    /// Blocks made, and empty blocks let go, since the start: what keeping
+    /// empty ones costs is these two against each other.
+    made_blocks: u64,
+    let_go: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, made_blocks: 0, let_go: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -262,6 +285,7 @@ impl<B: Clone> Pool<B> {
             }
         };
         self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.made_blocks += 1;
         i
     }
 
@@ -283,7 +307,7 @@ impl<B: Clone> Pool<B> {
             }
         }
         // (Without a piece given back too, once there is less room.)
-        let most = SPARES.load(Ordering::Relaxed).min(self.most);
+        let most = kept(self.most);
         if any || most < self.spare {
             self.spare = most;
             let mut spare = 0;
@@ -292,6 +316,7 @@ impl<B: Clone> Pool<B> {
                     spare += 1;
                     if spare > most {
                         *block = None;
+                        self.let_go += 1;
                     }
                 }
             }
@@ -301,6 +326,30 @@ impl<B: Clone> Pool<B> {
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
+
+    /// The blocks with nothing in them now.
+    fn empty(&self) -> usize {
+        self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count()
+    }
+}
+
+/// The most empty blocks a pool keeps: what the card's room says
+/// ([`room`]), no more than the pool's own limit, and no more than
+/// `VICTORY_POOL_SPARE` when that is set.
+fn kept(most: usize) -> usize {
+    let by_room = SPARES.load(Ordering::Relaxed).min(most);
+    match spare_most() {
+        Some(cap) => by_room.min(cap),
+        None => by_room,
+    }
+}
+
+/// Blocks made and empty blocks let go since the start, and how many blocks
+/// there are now and how many of those are empty: for the VRAM ledger.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn block_counts() -> [u64; 4] {
+    let pool = lock(&TEXTURES);
+    [pool.made_blocks, pool.let_go, pool.blocks() as u64, pool.empty() as u64]
 }
 
 /// A mapped upload buffer's memory.
@@ -566,6 +615,95 @@ mod tests {
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+
+    /// `VICTORY_POOL_SPARE` lowers whichever of the two the card's room
+    /// picked, and never raises it; unset, it changes nothing.
+    #[test]
+    fn the_switch_lowers_the_empty_blocks_and_never_raises_them() {
+        // What the room alone says, with the switch read from the setting
+        // the process was started with.
+        let by_room = |room: usize, most: usize| room.min(most);
+        assert_eq!(kept(SPARE_KEPT), by_room(SPARES.load(Ordering::Relaxed), SPARE_KEPT));
+        match spare_most() {
+            None => assert_eq!(kept(SPARE_KEPT), by_room(SPARES.load(Ordering::Relaxed), SPARE_KEPT)),
+            Some(cap) => {
+                assert_eq!(kept(SPARE_KEPT), by_room(SPARES.load(Ordering::Relaxed), SPARE_KEPT).min(cap));
+                assert!(kept(SPARE_KEPT) <= cap, "the switch never keeps more than it says");
+            }
+        }
+        // A number of blocks, or nothing at all: a value that is not one is
+        // no cap, which is what every run before the switch did.
+        assert_eq!(Some(0), "0".trim().parse::<usize>().unwrap().into());
+        assert_eq!(None, "x".trim().parse::<usize>().ok());
+        assert_eq!(None, "".trim().parse::<usize>().ok());
+        assert_eq!(Some(3), " 3 ".trim().parse::<usize>().ok());
+    }
+
+    /// Blocks made ahead are no more than the cap allows: a pool that keeps
+    /// two empty blocks does not make eight ahead for them to be let go.
+    #[test]
+    fn blocks_made_ahead_follow_the_cap() {
+        let most = kept(usize::MAX);
+        assert_eq!(kept(SPARE_KEPT), most, "a pool's own limit is not a lower one");
+        assert!(most <= SPARE_KEPT);
+        if let Some(cap) = spare_most() {
+            assert!(Ripe::now().ahead <= cap, "{} made ahead, the cap is {cap}", Ripe::now().ahead);
+        }
+        assert!(Ripe::now().ahead <= most);
+    }
+
+    /// The cap the switch sets is what the pool then keeps: with it at two,
+    /// a pool told the card has room still lets empty blocks go past two.
+    #[test]
+    fn a_capped_pool_lets_empty_blocks_go() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let mut taken: Vec<Piece> = Vec::new();
+        // Eighth-block pieces, so the run needs many blocks.
+        for _ in 0..300u64 {
+            let (p, _, _) = pool.take(BLOCK / 8, 65536, 0, make).unwrap();
+            taken.push(p);
+        }
+        let blocks = pool.blocks();
+        assert!(blocks > SPARE, "the run needed more blocks than the spare ones");
+        for p in taken {
+            pool.give(p, 20);
+        }
+        // The most that may stay is what `kept` says, whatever the room says.
+        pool.rested(20 + REST);
+        let most = kept(SPARE_KEPT);
+        assert!(pool.blocks() <= blocks.min(most).max(1), "{} blocks kept of {blocks}, most {most}", pool.blocks());
+        assert!(pool.empty() <= most, "{} empty kept, most {most}", pool.empty());
+        assert!(pool.let_go > 0, "empty blocks were let go, not just counted");
+        assert_eq!(pool.made_blocks, blocks as u64);
+    }
+
+    /// One block asked for past the cap is made again; the count says so.
+    #[test]
+    fn a_block_let_go_and_made_again_is_counted_twice() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let (p, _, _) = pool.take(65536, 65536, 0, make).unwrap();
+        assert_eq!((pool.made_blocks, pool.let_go), (1, 0));
+        pool.give(p, 0);
+        pool.rested(REST);
+        // Past the two kept: this one block is the only one, so it stays.
+        assert_eq!((pool.made_blocks, pool.let_go), (1, 0));
+        // Two halves fill the block that is there; a third needs another.
+        let mut more: Vec<Piece> = Vec::new();
+        for _ in 0..3 {
+            more.push(pool.take(BLOCK / 2, 65536, 0, make).unwrap().0);
+        }
+        assert_eq!(pool.made_blocks, 2, "a second block was made");
     }
 
     #[test]
