@@ -26,6 +26,24 @@ if ($Safe) {
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
+# What was measured on the card that draws, by its vendor (0x10DE NVIDIA, 0x1002 AMD):
+# a setting that measured better on one is not set on the other. The card that draws is
+# the one with a display mode (an iGPU beside a card has none). -Safe stays as it was.
+$vendor = $null
+$cards = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+    Where-Object { $_.PNPDeviceID -match 'VEN_[0-9A-Fa-f]{4}' })
+$draws = @($cards | Where-Object { $_.CurrentHorizontalResolution -gt 0 })
+$card = @($draws) + @($cards) | Select-Object -First 1
+if ($card -and $card.PNPDeviceID -match 'VEN_([0-9A-Fa-f]{4})') {
+    $vendor = [Convert]::ToUInt32($Matches[1], 16)
+}
+# NVIDIA fills the card with host copies of textures picked by index and stops there
+# (VICTORY_TEXTURE_ROOM_PERCENT, crates/victory-gpu/src/resource.rs; 90 by default):
+# at 97 its runs held the depth and the picture and lost no frame time.
+if ($vendor -eq 0x10DE -and -not $Safe -and -not $More.ContainsKey('VICTORY_TEXTURE_ROOM_PERCENT')) {
+    $settings.VICTORY_TEXTURE_ROOM_PERCENT = '97'
+}
+
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }
