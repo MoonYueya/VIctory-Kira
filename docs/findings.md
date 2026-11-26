@@ -539,3 +539,65 @@ first.
 Fixed by this work: the ledger itself. Not settled: whether lowering the empty-block reserve
 gives the textures the room back without making the pool re-create blocks, and what the
 buffer copies cost in frame time when they are not on the card.
+
+## The console profile: what Series S costs and saves, RTX 3080 (two runs)
+
+`victory run --console series-s` tells the title it is on a Series S. In this tree that
+changes three things the title can see, and nothing else:
+
+| What | Series X | Series S | Where |
+|---|---|---|---|
+| `ConsoleMode` under `HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM` | `0x64` | `0x60` | `crates/victory-hle/src/modules/xsystem.rs:164-169` |
+| `AnalyticsInfo.form` | `"Xbox Series X"` | `"Xbox Series S"` | `crates/victory-hle/src/modules/xsystem.rs:110` |
+| Title memory: `XMemGetWorkingSetStatistics` and the DXGI adapter's memory | `(10 GiB, 3.5 GiB)` | `(0, 7,776 MiB)` | `crates/victory-gpu/src/console.rs:22-27`, read at `xmem.rs:1819` and `dxgi.rs:154` |
+
+GPU capability is **not** part of it: every `D3D12_FEATURE` query reports the host card's
+own answer (`device.rs`, `host.rs`), and `console::current()` is not on any of those paths.
+Saves and the cache do not carry the console either (`run.rs:92` keys storage by title id
+alone; the pipeline fingerprint is translation version + driver, `known.rs:202-209`), so one
+data folder and one cache serve both.
+
+**Two runs, one each, same switches, same warm cache, 600 s, world reached in both, no
+device removal and no panic in either.** Numbers are the world section's medians from
+`VICTORY_VRAM_LEDGER=1`:
+
+| | Series X | Series S | |
+|---|---|---|---|
+| Card in use (as the system counts it) | 9,248 MB | **6,790 MB** | −27 % |
+| Of its budget | **120.5 %** | **90.5 %** | over → under |
+| Render targets and unordered-access textures | 3,038 MB | **1,371 MB** | −55 % |
+| Blocks of texture memory, whole | 3,008 MB | 3,136 MB | +4 % |
+| — of them empty and kept | 1,396 MB | 1,763 MB | +26 % |
+| Title textures the title fills | 1,612 MB | 1,373 MB | −15 % |
+| Passes that made none for lack of room | 565 | **74** | |
+| Passes over unmapped slots | 12,140 | 27,307 | |
+| Private memory, peak | 27,813 MB | **23,426 MB** | −4.4 GB |
+| World frame, median | 396.8 ms | 425.0 ms | +7 % |
+
+**The saving is the resolution, not a better use of the same pixels.** The same logs show
+the title's main render targets fall from 3840×2160 and 2560×1440 to 1920×1080 and
+1280×720, and the captured frames' presentation size halves from 1920×1080 to 960×540
+(captures are written at half size, `capture.rs:163-166`, so 4K → 1080p). The render-target
+class shrinks by exactly the factor the pixel count does. **No class of card memory got
+smaller at the same resolution** — the block pool, which the console does not touch
+(`pool.rs` keeps its empty blocks whatever the profile), grew slightly instead.
+
+The frame time does not improve even though the GPU side does: `gpu` falls from 83.2 ms to
+36.6 ms median while `prepare` rises from 50.6 ms to 64.9 ms, and the frame is 7 % longer.
+At this stage the world is limited by preparation and copy-back, not by shading, so taking
+half the pixels away buys nothing. Series S is a memory measure here, not a speed one.
+
+One thing Series S alone brings: **three compute shaders do not translate under it** that do
+under Series X (`GFX10 code at 0x218: a lane mask exchanged where not every lane runs is not
+supported`), so their draws are dropped. Series X translated 2,528 shaders with none
+refused; Series S translated 2,690 with those three. That is a picture risk on top of the
+resolution.
+
+**Not worth making the default.** On a 4K display the picture is visibly softer, and the
+frame time does not pay for it. It is worth having as an explicit choice for a card with
+8 GB or a machine short of system memory — which is what `scripts/play.ps1 -SeriesS` is, and
+it changes nothing when the switch is not given.
+
+Not settled: whether lowering the empty-block reserve under Series S gives the textures that
+room back (1,763 MB of empty blocks were still held), and how much picture the three dropped
+compute shaders cost. Both need runs of their own.

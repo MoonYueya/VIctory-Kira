@@ -231,6 +231,9 @@ export async function runTitle(settings, {
   mkdirSync(dataDir, { recursive: true });
 
   const args = ['run', exeInOverlay, '--execute', '--unimplemented', 'zero'];
+  // Only when one was asked for: a run that does not name a console gets `victory run`'s
+  // own default, so an unchanged settings file starts exactly what it started before.
+  if (settings.console) args.push('--console', settings.console);
   const env = childEnv(settings, {
     VICTORY_GAME_DIR: settings.paths.overlay,
     VICTORY_CACHE_DIR: cacheDir,

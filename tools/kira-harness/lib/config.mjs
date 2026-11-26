@@ -65,6 +65,15 @@ export function loadSettings(explicit) {
     dataTemplate: expand(raw.dataTemplate),
     /** How long a run may last, in seconds. */
     seconds: Number(raw.seconds || 180),
+    /**
+     * The console model the title is told it runs on: `series-x` or `series-s`, or null
+     * to leave the choice to `victory run` (Series X).
+     *
+     * A setting rather than an argument because it is a fact about the run being
+     * compared, like `seconds`: two runs of one experiment point at one settings file
+     * and differ in this line (`apps/victory/src/main.rs:143`, `--console`).
+     */
+    console: raw.console === 'series-s' || raw.console === 'series-x' ? raw.console : null,
     /** Extra key presses to compile into `VICTORY_KEYS`, in seconds after the start. */
     keys: Array.isArray(raw.keys) ? raw.keys : [],
     /** Set no key presses at all. */
