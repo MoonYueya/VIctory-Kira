@@ -23,6 +23,20 @@ If you want the run to skip the title's first setup, point `dataTemplate` at a s
 that has already been through it. The folder is copied in fresh for every run and is never
 written to. It is not part of the repository.
 
+`cacheDir` names one cache directory kept across runs (the title's translated shaders, the
+pipeline library and the images live in it). Left null, every run gets a fresh one under
+`work`. Point it at a folder you keep if two runs are to be compared: a fresh folder makes
+each of them translate its thousand shaders and build its thousands of pipelines again, and
+those minutes are part of what gets measured. Only one run may write it at a time; the run
+lock already sees to that.
+
+`lock` names the file a run takes so no second run starts beside it. Left null it is one
+file beside `work`, not inside it: two run folders next door (two builds, two people) share
+that file without either having to know the other's `work`. Set it to one path everyone
+agrees on when they live further apart. Beside the lock, a run also waits while any
+`victory.exe` or the title's own executable is up — before taking the lock and again after —
+since a lock only stops the runs that honour it.
+
 ## One run
 
     node tools/kira-harness/run-one.mjs --id first --commit <hash>
