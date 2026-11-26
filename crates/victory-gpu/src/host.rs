@@ -8741,6 +8741,7 @@ impl Host {
             && let Some(b) = &buffer
         {
             crate::book::made(b, || "an upload buffer".into());
+            crate::vram::note(b, crate::vram::class::STAGING, size);
         }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
@@ -9514,6 +9515,7 @@ impl Host {
             && let Some(b) = &buffer
         {
             crate::book::made(b, || "a shared buffer".into());
+            crate::vram::note(b, crate::vram::class::STAGING, size);
         }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
@@ -9599,7 +9601,12 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let b = buffer?;
+                #[cfg(feature = "diagnostics")]
+                crate::vram::note(&b, crate::vram::class::WINDOW_MAPPED, size);
+                Some((b, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no buffer in card memory the CPU maps");
                 None
@@ -9645,6 +9652,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
+            crate::vram::note(b, crate::vram::class::UAV, size);
         }
         let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
         match made {

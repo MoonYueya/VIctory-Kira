@@ -319,6 +319,14 @@ fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
 /// Bytes of the pieces textures hold now.
 static HELD: AtomicU64 = AtomicU64::new(0);
 
+/// The same, and how many blocks there are, for the VRAM ledger: the part of
+/// the blocks that textures hold, and the blocks themselves.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn held_pieces() -> (u64, u64) {
+    let held = HELD.load(Ordering::Relaxed).min((lock(&TEXTURES).blocks() as u64) * BLOCK);
+    (held, lock(&TEXTURES).blocks() as u64)
+}
+
 /// Bytes of the texture blocks no texture holds: the card's memory in use
 /// by us that new textures take first.
 pub(crate) fn texture_room() -> u64 {

@@ -89,6 +89,8 @@ mod upload;
 mod watch;
 #[cfg(windows)]
 mod texback;
+#[cfg(windows)]
+mod vram;
 
 #[cfg(windows)]
 pub use host::on_failure;

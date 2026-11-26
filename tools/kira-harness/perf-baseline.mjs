@@ -63,6 +63,9 @@ const VIDEOMEM = /the card's own: budget (\d+) MB, in use (\d+) MB, (\d+) MB cou
 const PROC = /process: private ([\d,]+) MB, working set ([\d,]+) MB|private ([\d,]+) MB of ([\d,]+) MB/;
 const QUEUE = /textures picked by index: (\d+) uploaded so far \((\d+) MB\), (\d+) waiting, (\d+) passed over unmapped/;
 const CATS = /memory by category \(VICTORY_MEMORY_CATEGORIES=1, approximate and overlapping, not a sum\): (.+)$/;
+// The VRAM ledger (crates/victory-gpu/src/vram.rs, VICTORY_VRAM_LEDGER=1): one line,
+// "name 123 MB/45" per class, the account and the unaccounted rest.
+const LEDGER = /vram ledger \(VICTORY_VRAM_LEDGER=1\), live, MB\/things: (.+)$/;
 
 // ---------------------------------------------------------------- reading
 const lines = readFileSync(logPath, 'utf8').split(/\r?\n/);
@@ -72,6 +75,7 @@ const submits = [];
 const records = [];
 const videomem = [];
 const cats = [];
+const ledgers = [];
 let notTranslated = 0;
 let translated = 0;
 let deviceRemoved = 0;
@@ -130,6 +134,18 @@ for (const raw of lines) {
     });
     continue;
   }
+  if (line.includes('vram ledger')) {
+    const m = LEDGER.exec(line);
+    if (m) {
+      const fields = {};
+      for (const part of m[1].split('; ')) {
+        const mm = /^(.+?) (-?[\d.]+) MB\/(\d+)$/.exec(part.trim());
+        if (mm) fields[mm[1].trim()] = { mb: Number(mm[2]), count: Number(mm[3]) };
+      }
+      ledgers.push({ at: line.slice(0, 24).trim(), fields });
+    }
+    continue;
+  }
   if (line.includes('memory by category')) {
     const m = CATS.exec(line);
     if (m) {
@@ -160,6 +176,7 @@ const worldSubmits = submits.filter(inWorld);
 const worldRecords = records.filter(inWorld);
 const worldVideo = videomem.filter(inWorld);
 const worldCats = cats.filter(inWorld);
+const worldLedgers = ledgers.filter(inWorld);
 
 // The frame line covers the seconds since the previous one, and the card's clock
 // line is printed once a second: a frame line is paired with the average of the
@@ -281,6 +298,22 @@ const report = {
     },
     buckets: perBucket,
   },
+  vram: {
+    rows: worldLedgers.length,
+    // Every class the ledger prints, median and peak over the world section.
+    classes: (() => {
+      const names = new Map();
+      for (const row of worldLedgers) {
+        for (const [k, v] of Object.entries(row.fields)) {
+          if (!names.has(k)) names.set(k, []);
+          names.get(k).push(v.mb);
+        }
+      }
+      return Object.fromEntries([...names].map(([k, list]) => [k, stats(list)]));
+    })(),
+    first: worldLedgers.length ? worldLedgers[0].fields : null,
+    last: worldLedgers.length ? worldLedgers[worldLedgers.length - 1].fields : null,
+  },
   memory: {
     rows: cats.length,
     last: cats.length ? cats[cats.length - 1].fields : null,
@@ -328,6 +361,15 @@ out.push('');
 out.push('- shaders translated ' + translated + ', not translated ' + notTranslated);
 out.push('- pipeline library made ' + pipelineMade + ', loaded ' + pipelineLoaded);
 out.push('- device removals ' + deviceRemoved);
+if (report.vram.rows) {
+  out.push('');
+  out.push('### VRAM ledger, world section (' + report.vram.rows + ' lines, ' +
+    (report.vram.classes['in use, as the system counts it'] || {}).n + ' with the system\'s own count)');
+  out.push('');
+  out.push('| what holds it | median MB | peak MB | n |');
+  out.push('|---|---|---|---|');
+  for (const [k, s] of Object.entries(report.vram.classes)) out.push('| ' + k + ' | ' + r(s.median) + ' | ' + r(s.max) + ' | ' + s.n + ' |');
+}
 if (report.memory.last) {
   out.push('');
   out.push('### Memory by category, last line in the world section');
