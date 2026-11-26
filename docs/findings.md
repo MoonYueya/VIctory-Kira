@@ -266,3 +266,52 @@ eviction of card memory, which lines up with the second.
 Two earlier runs of this build were thrown away: one ran while another build of the layer
 was playing on the same card, and one used a shader cache that the other build had written
 to. Both are excluded above, and neither is a number in this note.
+### `VICTORY_ASYNC_SUBMIT` is already on with `play.ps1`'s switches, and a larger
+### texture share holds up over ten minutes (2026-11-26, `f59a315`)
+
+**One correction to the paragraph above.** `VICTORY_ASYNC_SUBMIT` is described there as
+off by default. It is off by its own variable, but it is **on** whenever `VICTORY_THIN=1`
+is set, which `scripts/play.ps1` does: `queue/behind.rs` reads
+
+```rust
+(std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
+ || crate::list::thin::wanted()) && started()
+```
+
+and `list/thin.rs`'s `wanted()` is `VICTORY_THIN == "1"`. Every run under `play.ps1`'s
+default switches therefore already has its submissions prepared on a thread of ours; the
+log says so (`submissions are prepared and sent by a thread of ours`). Its preconditions —
+`host::late_free_present()`, which the relay sets, and `queue::cuts()`, on by default — are
+met by the same switch set, so the relay is a **dependency** of it, not a competitor.
+
+**Turning it off costs nothing measurable here, and empties the card.** With
+`VICTORY_THIN=0` (which turns it off) the median world frame was 341.8 ms against 344.5 ms
+with it on — inside noise — while the time the card spent on the frame fell from 58.6 ms to
+14.2 ms. On this PC the frame is CPU-bound on the 3080, so the switch's own effect cannot be
+seen at the frame line; it should be measured in a switch set where `VICTORY_THIN` is off,
+where it is a switch of its own.
+
+**The larger texture share holds over ten minutes.** A 605 s run with
+`VICTORY_TEXTURE_ROOM_PERCENT=97` (against the 90 of the run before it, same build, same
+cache, same 480 s window):
+
+| | 90 % (480 s) | 97 % (605 s) |
+|---|---|---|
+| world frames / median frame | 73 / 367.5 ms | 101 / **344.5 ms** |
+| worst frame | 11,440.3 ms | **465.8 ms** |
+| the card with nothing of ours queued | 176.3 ms | **162.7 ms** |
+| textures uploaded / waiting | 3,482 MB / 3,188 | 3,483 MB / 5,786 |
+| slots passed over, unmapped | 9,996 | 11,075 |
+| frame picture, mean / sd (median) | 67.1 / 51.2 | 65.2 / 50.9 |
+| black frames | 0 of 51 | 0 of 90 |
+| card in use / budget | 8,946 / 8,033 MB | 9,136 / 7,981 MB |
+| device removals, panics, refused translations | 0 | 0 |
+
+Both runs are over the budget the system gives the card, as the note above this one says
+they are; 97 adds three points to that. **`scripts/play.ps1` now sets 97 on NVIDIA cards
+only** (vendor `0x10DE`, read from the display adapter's PNP id), and leaves AMD at 90.
+
+**Not measured:** whether 97 is safe on an NVIDIA card with less than 10 GB, and whether the
+frame-time gain repeats (one run each; read differences under 5 % as nothing, and this one is
+6 %).
+
