@@ -5773,6 +5773,7 @@ impl Host {
         ahead.part(13);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
+        crate::submit_stages::mark(crate::submit_stages::Stage::Descriptors);
         let heaps_synced = crate::descriptor::begin_sync_heaps();
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
@@ -5849,6 +5850,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
+            crate::submit_stages::mark(crate::submit_stages::Stage::Watch);
             crate::watch::ask_once(&ranges);
             #[cfg(feature = "diagnostics")]
             split.part(0);
@@ -5885,6 +5887,7 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
+        crate::submit_stages::mark(crate::submit_stages::Stage::Deferred);
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
@@ -5900,6 +5903,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(2);
         stage.next("submit: snapshots");
+        crate::submit_stages::mark(crate::submit_stages::Stage::Snapshots);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -5913,6 +5917,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(3);
         stage.next("submit: copies in the card's memory");
+        crate::submit_stages::mark(crate::submit_stages::Stage::CardSetup);
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -5949,6 +5954,7 @@ impl Host {
         split.part(15);
         let prepared = std::time::Instant::now();
         stage.next("submit: sending");
+        crate::submit_stages::mark(crate::submit_stages::Stage::Execute);
         // When it runs on the card, for the timeline.
         #[cfg(feature = "diagnostics")]
         let stamp = stamps::take();
@@ -5974,6 +5980,7 @@ impl Host {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
+                    crate::submit_stages::executing(to - from);
                     from = to;
                 }
                 self.queue.Signal(&self.fence, *submitted)
@@ -6023,12 +6030,14 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        crate::submit_stages::mark(crate::submit_stages::Stage::Execute);
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                crate::submit_stages::executing(group.len());
                 self.card_sent();
                 let waited = self
                     .queue
@@ -6039,6 +6048,8 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         working(false);
+                        // (The wait for the card is part of the sending, and so
+                        // of its stage.)
                         #[cfg(feature = "diagnostics")]
                         let _card = crate::timeline::card_wait(Some(*submitted));
                         WaitForSingleObject(self.event, INFINITE);
@@ -6108,6 +6119,7 @@ impl Host {
         }
         submitting(3, runs.len());
         stage.next("submit: copying back");
+        crate::submit_stages::mark(crate::submit_stages::Stage::CopyBack);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -9326,6 +9338,13 @@ impl Meter {
         crate::descriptor::sync_line(frames);
         late_line(frames);
         crate::queue::behind_line(frames);
+        #[cfg(feature = "diagnostics")]
+        {
+            let stages = crate::submit_stages::line(frames);
+            if !stages.is_empty() {
+                tracing::info!("the submitting thread per frame (VICTORY_SUBMIT_STAGES=1){stages}");
+            }
+        }
         card_clock_line(frames, ms);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
