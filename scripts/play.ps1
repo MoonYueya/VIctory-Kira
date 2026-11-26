@@ -2,6 +2,8 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
+# -SeriesS      play as an Xbox Series S instead of a Series X: the title renders at a lower
+#               resolution and sizes its memory down (the picture is softer; see docs/findings.md)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
@@ -9,6 +11,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$SeriesS,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -44,6 +47,10 @@ if ($vendor -eq 0x10DE -and -not $Safe -and -not $More.ContainsKey('VICTORY_TEXT
     $settings.VICTORY_TEXTURE_ROOM_PERCENT = '97'
 }
 
+# The console the title is told it runs on (apps/victory/src/main.rs, --console): Series X
+# unless -SeriesS. Not an environment variable, so it goes on the command line below.
+$console = if ($SeriesS) { 'series-s' } else { 'series-x' }
+
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }
@@ -53,4 +60,4 @@ Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-O
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+try { & $victory run $Exe --execute --console $console } finally { Pop-Location }
