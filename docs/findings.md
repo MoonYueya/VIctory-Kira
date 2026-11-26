@@ -377,3 +377,54 @@ shape a next attempt should take, not #72's 75/67.5.
 
 Full numbers, run ids and grades: `VIctory-Kira-reports/GC72-PR-EVAL-2026-11-26.md`
 (outside this repository).
+
+### The Marvisak eviction water marks, ported and measured on RTX 3080, 2026-11-26
+
+A port of the policy of Marvisak/VIctory `63bcca4`, behind `VICTORY_EVICT=1`, was tried on branch [`experiment/evict`](https://github.com/MoonYueya/VIctory-Kira/commits/experiment/evict) (`da0e7bb`) and **not merged into `main`**. It ports
+(`crates/victory-gpu/src/resource.rs`, `evict_unused`: `BUDGET_HIGH` 0.90,
+`BUDGET_LOW` 0.85, `IDLE_MS` 120,000, `IDLE_FRAMES` 300, `SOON_FRAMES` 10, only
+textures rebuildable from title memory) onto this fork's own sweep, which already gave
+up the same copies on its own water level (88/95 % down to 85 %, `IDLE_MS` 5,000,
+four frames) and already spared what the host wrote. The port is the water marks, the
+idle time and frame count, and a counter for copies made again soon after being given
+up. (That counter only reached a log written on device removal, so it was not observed
+in these runs; the existing `let go / made again` counts below stand in for it.)
+
+Measured against this fork's `main` switch-off path from the same binary (so the
+control is the same code with the branch not taken), one prewarmed cache, 480 s per
+run, unattended into the world.
+
+| | control | `VICTORY_EVICT=1` |
+|---|---|---|
+| World frame time, median | 319.5 ms | **308.5 ms** (−3.4 %) |
+| World frames sampled | 76 | 69 |
+| Draws/frame, median | 4,771 | 4,767 |
+| Passes that made none for lack of room (last) | 565 | **1,221** |
+| Textures passed over unmapped (last) | 9,912 | **10,477** |
+| Card use / DXGI budget (last) | 9,224 / 7,835 MB | **8,530 / 7,847 MB** |
+| Copies let go / made again (since start) | 36,942 / 1,612 | 40,165 / 1,729 |
+| Device removed / panic / untranslated | 0 / 0 / 0 | 0 / 0 / 0 |
+
+**Not kept, and not made a default.** The port does what it says: the card holds about
+700 MB less through the whole world segment, and frame time does not regress. But it
+does not reach either half of the goal. The card stays 683 MB over its budget, so the
+over-budget condition that the whole line of work is about is still there; and both of
+the shortage counters the goal names move the wrong way — `lack of room` more than
+doubles (565 to 1,221) and `passed over unmapped` rises (9,912 to 10,477). A change
+that frees memory while more passes fail for lack of room is moving copies the renderer
+is about to ask for again, only more slowly than #72's 75 % water mark did.
+
+What this does not settle: the 0.90 water mark is above the renderer's own admission
+test, which fills the card to 90 % of the same budget, so on a card whose budget the
+system keeps lowering under it (7.6-8.0 GB here, against 9.2 GB in use) the pass runs
+under a budget that is below what is already committed — the water mark is crossed by
+construction and the idle time is all that holds it back. Whether a water mark below
+the admission test can free memory without causing the re-upload it is meant to avoid
+is exactly what #72 answered in the negative at 75 %, and what this run answers for
+0.90/0.85 on this card: it frees, but the counters still get worse.
+
+`VICTORY_WINDOW_BUDGET_MB=512` (#77) was run a third time and again never engaged —
+no sweep line, and the live window copies were under the cap. Its band only acts when
+system RAM is under pressure, and this host had 22 GB free, so the run is a
+control-equivalent, not a measurement of the cap.
+
