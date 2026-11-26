@@ -369,6 +369,11 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// What [`State::tables`] made for the stage being bound: root parameter,
+    /// byte offset of its fresh table. The storage is kept from one draw to
+    /// the next, so a draw does not allocate for it (from Belobug e6b6386,
+    /// romainhedouin: `up to 2 + 1 + 1 allocations per draw` fewer).
+    made: Vec<(u8, u32)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -1553,13 +1558,13 @@ impl State {
             }
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
-            if made.iter().any(|m| m.1 == u32::MAX) {
+            if !made {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
             if stage.shader.ambient.is_some() {
                 self.ambient_tables.clear();
-                self.ambient_tables.extend(made.iter().copied());
+                self.ambient_tables.extend(self.made.iter().copied());
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
@@ -1599,7 +1604,8 @@ impl State {
                             self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
                         continue;
                     }
-                    let fresh = made
+                    let fresh = self
+                        .made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
@@ -3220,20 +3226,25 @@ impl State {
     /// constant buffer are made afresh for the draw in dynamic slots, with
     /// the constant data copied to upload memory when the list is
     /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
+    /// console only 16. Those tables' new byte offsets, by root parameter,
+    /// are left in `self.made` (kept from one draw to the next: a draw does
+    /// not allocate for them, from Belobug e6b6386, romainhedouin); the
+    /// other tables' slots are made from the title's.
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    ///
+    /// False when the draw must be dropped: a constant table found no
+    /// dynamic slots.
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         compute: bool,
-    ) -> Few<(u8, u32), 16> {
+    ) -> bool {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Few<u8, 16> = Few::default();
         for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
@@ -3268,7 +3279,10 @@ impl State {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Few::default();
+        // Taken out so `self` stays free to borrow; a draw dropped below
+        // leaves it empty, and it grows again (from Belobug e6b6386).
+        let mut made = std::mem::take(&mut self.made);
+        made.clear();
         for &slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -3318,18 +3332,27 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
+            let mut records: Vec<[u32; 3]> = Vec::with_capacity(n as usize);
             let key = {
                 let mut h = RecordHash::default();
                 for k in 0..n {
-                    let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
-                    h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+                    let words = unsafe { record_at(table, k) };
+                    h.add(words);
+                    records.push(words);
                 }
                 (table, n, h.0)
             };
+            // A hash hit is only the same table when its records are too: a
+            // collision costs a copy here, not wrong descriptors (from
+            // Belobug b41f3f3, romainhedouin).
+            let same = self
+                .fresh_tables
+                .get(&key)
+                .is_some_and(|known| known.records.len() == records.len() && known.records == records);
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (used.as_ptr() as usize, used.len(), STORES.get(), TESTED_DEPTH.get().0);
-            if let Some(known) = self.fresh_tables.get_mut(&key) {
+            if same && let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
@@ -3384,10 +3407,10 @@ impl State {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 dropped_for_no_slot();
-                made.push((slot, u32::MAX));
-                continue;
+                self.made.clear();
+                return false;
             };
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new(), records });
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -3494,7 +3517,8 @@ impl State {
             }
             made.push((slot, first * 32));
         }
-        made
+        self.made = made;
+        true
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -4232,6 +4256,10 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
 /// A table made afresh in dynamic slots, in a list ([`State::tables`]).
 struct FreshTable {
     first: u32,
+    /// The record words (of the `n` entries it was made from) the table held
+    /// when it was made: a hash hit that is another table's is not it
+    /// (from Belobug b41f3f3, romainhedouin).
+    records: Vec<[u32; 3]>,
     /// The list's epoch ([`HostList::epoch`]) at which all its entries that
     /// these readers (a stage's list of what it reads, whether it stores, the
     /// tested depth target) read were brought up to date, and whether that read the
@@ -4245,6 +4273,15 @@ struct FreshTable {
 /// through again at every draw).
 fn ready_once() -> bool {
     crate::toggled!("VICTORY_READY_ONCE")
+}
+
+/// The words of entry `k` of `table` (a descriptor record in title memory)
+/// (from Belobug b41f3f3, romainhedouin).
+///
+/// # Safety
+/// `table + k * 32` is a descriptor slot in title memory.
+unsafe fn record_at(table: u64, k: u32) -> [u32; 3] {
+    unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() }
 }
 
 /// A hash of records' words: 64 bits, two multiplications a record. (The
@@ -4577,7 +4614,7 @@ mod tests {
 
 #[cfg(test)]
 mod record_hash_tests {
-    use super::{Few, RecordHash};
+    use super::{Few, RecordHash, record_at};
 
     #[test]
     fn a_few_things_are_kept_in_order_however_many() {
@@ -4612,5 +4649,40 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+    /// A hash hit whose record words are another table's is not that table:
+    /// the words are compared, and a collision costs a copy, not wrong
+    /// descriptors (from Belobug b41f3f3, romainhedouin).
+    #[test]
+    fn a_table_is_the_one_made_before_only_with_the_same_record_words() {
+        // A table of records in our own memory, 32 bytes a record, as the
+        // title's descriptors are, read as `tables` reads title memory.
+        let mut bytes = vec![0u8; 64 * 32];
+        let mut first = Vec::new();
+        for k in 0..64u32 {
+            let r = [k, 0x1000 + k, 0x2000];
+            for (n, w) in r.iter().enumerate() {
+                bytes[k as usize * 32 + n * 4..k as usize * 32 + n * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            first.push(r);
+        }
+        let mut was = first.clone();
+        // One record another table's: the hashes of the two are apart.
+        was[7] = [0xdead, 0xbeef, 0xcafe];
+        let hash = |records: &[[u32; 3]]| {
+            let mut h = RecordHash::default();
+            records.iter().for_each(|r| h.add(*r));
+            h.0
+        };
+        assert_ne!(hash(&first), hash(&was));
+        // That the words of the same table are found again, to the last one.
+        let at = bytes.as_ptr() as u64;
+        let read: Vec<[u32; 3]> = (0..first.len() as u32).map(|k| unsafe { record_at(at, k) }).collect();
+        assert_eq!(read, first);
+        // (A hash that did collide would be caught by the word compare the
+        // table makes, which is what `records` in `FreshTable` holds.)
+        let collided = |known: &[[u32; 3]], now: &[[u32; 3]]| known.len() == now.len() && known == now;
+        assert!(!collided(&was, &read));
+        assert!(collided(&first, &read));
     }
 }
