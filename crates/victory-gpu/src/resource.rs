@@ -1374,6 +1374,40 @@ pub(crate) fn want_level(this: This, first: u32) {
 pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
+/// With `VICTORY_EVICT=1`: the frame each texture's host copy was given up
+/// at, while it may still be counted as remade soon (Marvisak/VIctory
+/// 63bcca4, `GIVEN_UP`).
+#[cfg(windows)]
+static GIVEN_UP: std::sync::Mutex<Option<std::collections::BTreeMap<usize, u64>>> =
+    std::sync::Mutex::new(None);
+
+/// With `VICTORY_EVICT=1`: host copies given up, of which made again, and of
+/// those made again within `EVICT_SOON_FRAMES` frames (Marvisak/VIctory
+/// 63bcca4 `EVICTIONS[0]`, `[2]`, `[3]`): the last is the counter-metric
+/// for too eager an idle time.
+#[cfg(windows)]
+pub(crate) static EVICT_STATS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// A host copy is made for title texture `at`: counted if it had just been
+/// given up, and as remade soon if within `EVICT_SOON_FRAMES` frames.
+#[cfg(windows)]
+fn remade(at: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !crate::host::evict_marvisak() {
+        return;
+    }
+    let frame = crate::frame::current();
+    let mut given = GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(at_frame) = given.as_mut().and_then(|g| g.remove(&at)) else {
+        return;
+    };
+    EVICT_STATS[1].fetch_add(1, Relaxed);
+    if frame.saturating_sub(at_frame) <= crate::host::EVICT_SOON_FRAMES {
+        EVICT_STATS[2].fetch_add(1, Relaxed);
+    }
+}
+
 /// Every title texture alive (not buffers), by address: for the sweep and
 /// the memory line. A texture leaves the table before it is freed.
 #[cfg(windows)]
@@ -1627,6 +1661,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
+        // Given up a moment ago and made again: counted (VICTORY_EVICT).
+        remade(this as usize);
         *made = Some((std::sync::Arc::new(host), twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
@@ -2015,7 +2051,11 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
+    // 300 frames with `VICTORY_EVICT=1`, as Marvisak/VIctory 63bcca4
+    // (`IDLE_FRAMES`): at 30 fps the idle time decides which copies go,
+    // slower the card's budget does.
+    const IDLE_FRAMES_PLAIN: u64 = 4;
+    let idle_frames = if crate::host::evict_marvisak() { crate::host::EVICT_IDLE_FRAMES } else { IDLE_FRAMES_PLAIN };
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -2024,7 +2064,7 @@ pub(crate) fn let_go_idle() {
     {
         let mut replaced = REPLACED.lock().unwrap_or_else(|e| e.into_inner());
         let (gone, keep): (Vec<_>, Vec<_>) =
-            replaced.drain(..).partition(|(at, _)| crate::host::long_ago(*at, 1000, IDLE_FRAMES));
+            replaced.drain(..).partition(|(at, _)| crate::host::long_ago(*at, 1000, idle_frames));
         *replaced = keep;
         drop(replaced);
         for (_, made) in gone {
@@ -2055,7 +2095,7 @@ pub(crate) fn let_go_idle() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
-            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, idle_frames) {
                 by_age.push((used & 0xffff_ffff, at));
             }
         }
@@ -2091,13 +2131,13 @@ pub(crate) fn let_go_idle() {
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, idle_frames) || crate::texture::host_wrote(at) {
             continue;
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -2120,18 +2160,37 @@ pub(crate) fn let_go_idle() {
             if first.is_none() {
                 first = Some(at);
             }
+            // Who was given up, and at which frame, to count those made
+            // again soon after (`VICTORY_EVICT`).
+            if crate::host::evict_marvisak() {
+                EVICT_STATS[0].fetch_add(1, Relaxed);
+                let mut given = GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
+                given.get_or_insert_with(Default::default).insert(at, crate::frame::current());
+            }
             crate::host::retire(host);
         }
     }
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
-    if went > 0 {
+    if went > 0 || crate::host::evict_marvisak() {
+        let [given_up, again, soon] = [
+            EVICT_STATS[0].load(Relaxed),
+            EVICT_STATS[1].load(Relaxed),
+            EVICT_STATS[2].load(Relaxed),
+        ];
         crate::host::trail(|| {
             format!(
-                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}{}",
                 bytes >> 10,
-                first.unwrap_or(0)
+                first.unwrap_or(0),
+                // The counter-metric (`VICTORY_EVICT`): too eager an idle
+                // time shows as copies made again soon after being given up.
+                if crate::host::evict_marvisak() {
+                    format!("; evict: {given_up} given up in all, {again} made again, {soon} of those within {} frames", crate::host::EVICT_SOON_FRAMES)
+                } else {
+                    String::new()
+                }
             )
         });
     }
@@ -3321,6 +3380,23 @@ mod tests {
         visible_nodes: 0,
     };
 
+    /// VICTORY_EVICT gives up only host copies whose contents are in title
+    /// memory: a copy the host rendered to, wrote with a shader, or copied
+    /// into holds what the title could not give back, so it is spared
+    /// (evictable(), Marvisak/VIctory 63bcca4 crates/victory-gpu/src/resource.rs).
+    #[test]
+    fn evict_spares_what_the_title_cannot_give_back() {
+        // A texture the title fills: evictable.
+        assert!(fills(&texture(64, 64, 0, 1)));
+        // Render target, depth, unordered access, or any of them: not.
+        for flags in [0x1u32, 0x2, 0x4, 0x3, 0x7] {
+            let mut desc = texture(64, 64, 0, 1);
+            desc.flags = flags;
+            assert!(!fills(&desc), "flags {flags:#x}");
+        }
+        // A buffer is never a host copy fed from a texture.
+        assert!(!fills(&buffer(4096)));
+    }
     fn buffer(width: u64) -> ResourceDesc {
         ResourceDesc {
             dimension: BUFFER,

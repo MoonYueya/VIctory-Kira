@@ -142,12 +142,59 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
+    if evict_marvisak() {
+        return vram_keep_marvisak(budget, used);
+    }
     if used < share(88) {
         (KEPT_MS, u64::MAX)
     } else if used < share(95) {
         (IDLE_MS, used - share(85))
     } else {
         (SHORT_MS, used - share(85))
+    }
+}
+
+/// `VICTORY_EVICT=1`: the eviction of unused host copies as Marvisak/VIctory
+/// does it (63bcca4, `crates/victory-gpu/src/resource.rs` `evict_unused`):
+/// one water mark at 90 % of the card's budget, down to 85 %, and nothing
+/// under it let go that has not been idle for two minutes.
+pub(crate) fn evict_marvisak() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EVICT").is_some_and(|v| v == "1"))
+}
+
+/// How long a host copy must have been idle before `VICTORY_EVICT` lets it
+/// go while the card has room, and how many frames (Marvisak/VIctory
+/// 63bcca4: `IDLE_MS`, `IDLE_FRAMES`). Two minutes and 300 frames: of the
+/// textures given up after 20 s there, nine in ten were read again within a
+/// minute, and 30 frames gave up what the menus and loading made before the
+/// world read it.
+pub(crate) const EVICT_IDLE_MS: u64 = 120_000;
+pub(crate) const EVICT_IDLE_FRAMES: u64 = 300;
+/// `VICTORY_EVICT`: a host copy made again within this many frames of being
+/// given up counts as remade soon (Marvisak/VIctory 63bcca4: `SOON_FRAMES`):
+/// too eager an idle time.
+pub(crate) const EVICT_SOON_FRAMES: u64 = 10;
+
+/// [`vram_keep`] as Marvisak/VIctory 63bcca4 asks it (`VICTORY_EVICT=1`):
+/// one water mark, `BUDGET_HIGH` 0.90, down to `BUDGET_LOW` 0.85.
+pub(crate) const EVICT_BUDGET_HIGH: u64 = 90;
+pub(crate) const EVICT_BUDGET_LOW: u64 = 85;
+
+pub(crate) fn vram_keep_marvisak(budget: u64, used: u64) -> (u64, u64) {
+    const IDLE_MS: u64 = 5_000;
+    if budget == 0 {
+        return (IDLE_MS, u64::MAX);
+    }
+    let share = |percent: u64| budget / 100 * percent;
+    // Under the water mark nothing goes that has not been idle for
+    // EVICT_IDLE_MS; at it, still nothing (the pass asks for more than the
+    // mark, as `used > BUDGET_HIGH * budget` does there). Past it the least
+    // recently used go, idle or not, until the card is back under 85 %.
+    if used <= share(EVICT_BUDGET_HIGH) {
+        (EVICT_IDLE_MS, u64::MAX)
+    } else {
+        (IDLE_MS, used - share(EVICT_BUDGET_LOW))
     }
 }
 
@@ -10704,6 +10751,26 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(vram_idle_ms(None), 5_000);
         assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
     }
+
+    #[test]
+    fn evict_water_marks_follow_marvisak() {
+        // VICTORY_EVICT is read once per process, so this asks the policy
+        // function itself rather than the environment.
+        let gib = 1 << 30;
+        // Under BUDGET_HIGH (0.90) only what has been idle for IDLE_MS goes,
+        // and no bytes are given up: the card has room.
+        assert_eq!(super::vram_keep_marvisak(100 * gib, 0), (super::EVICT_IDLE_MS, u64::MAX));
+        assert_eq!(super::vram_keep_marvisak(100 * gib, 89 * gib), (120_000, u64::MAX));
+        // At the water mark itself nothing is given up: the Marvisak pass
+        // asks for strictly more than BUDGET_HIGH of the budget.
+        assert_eq!(super::vram_keep_marvisak(100 * gib, 90 * gib), (120_000, u64::MAX));
+        // Past it: enough goes to come back under BUDGET_LOW (0.85).
+        assert_eq!(super::vram_keep_marvisak(100 * gib, 91 * gib), (5_000, 6 * gib));
+        assert_eq!(super::vram_keep_marvisak(100 * gib, 100 * gib), (5_000, 15 * gib));
+        // No budget known: nothing is going for the card.
+        assert_eq!(super::vram_keep_marvisak(0, 7), (5_000, u64::MAX));
+    }
+
 
     #[test]
     fn textures_are_kept_while_the_card_has_room() {
