@@ -203,11 +203,24 @@ struct Pool<B> {
     /// empty ones costs is these two against each other.
     made_blocks: u64,
     let_go: u64,
+    /// A test's own answer to how many empty blocks stay, in place of what
+    /// the card's room and the switch say ([`kept`]). Set by
+    /// [`Pool::keeping`]; a pool that has it is the same whatever else
+    /// runs in the process.
+    own_most: Option<usize>,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, made_blocks: 0, let_go: 0 }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, made_blocks: 0, let_go: 0, own_most: None }
+    }
+
+    /// The same, keeping its own number of empty blocks instead of asking
+    /// what the card's room and the switch say: no global state, so a test
+    /// says what it means.
+    fn keeping(mut self, most: usize) -> Pool<B> {
+        self.own_most = Some(most.min(self.most));
+        self
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -307,7 +320,7 @@ impl<B: Clone> Pool<B> {
             }
         }
         // (Without a piece given back too, once there is less room.)
-        let most = kept(self.most);
+        let most = self.own_most.unwrap_or_else(|| kept(self.most));
         if any || most < self.spare {
             self.spare = most;
             let mut spare = 0;
@@ -337,8 +350,15 @@ impl<B: Clone> Pool<B> {
 /// ([`room`]), no more than the pool's own limit, and no more than
 /// `VICTORY_POOL_SPARE` when that is set.
 fn kept(most: usize) -> usize {
-    let by_room = SPARES.load(Ordering::Relaxed).min(most);
-    match spare_most() {
+    kept_with(SPARES.load(Ordering::Relaxed), most, spare_most())
+}
+
+/// The same from numbers given rather than read: what the card's room says
+/// (`by_room`), the pool's own limit, and the switch when it is set. No
+/// global state, so a test is not ordered against whatever else runs.
+fn kept_with(by_room: usize, most: usize, cap: Option<usize>) -> usize {
+    let by_room = by_room.min(most);
+    match cap {
         Some(cap) => by_room.min(cap),
         None => by_room,
     }
@@ -621,15 +641,20 @@ mod tests {
     /// picked, and never raises it; unset, it changes nothing.
     #[test]
     fn the_switch_lowers_the_empty_blocks_and_never_raises_them() {
-        // What the room alone says, with the switch read from the setting
-        // the process was started with.
-        let by_room = |room: usize, most: usize| room.min(most);
-        assert_eq!(kept(SPARE_KEPT), by_room(SPARES.load(Ordering::Relaxed), SPARE_KEPT));
-        match spare_most() {
-            None => assert_eq!(kept(SPARE_KEPT), by_room(SPARES.load(Ordering::Relaxed), SPARE_KEPT)),
-            Some(cap) => {
-                assert_eq!(kept(SPARE_KEPT), by_room(SPARES.load(Ordering::Relaxed), SPARE_KEPT).min(cap));
-                assert!(kept(SPARE_KEPT) <= cap, "the switch never keeps more than it says");
+        // The arithmetic, on numbers given rather than read: neither the
+        // card's room nor the switch is a global this test may depend on.
+        assert_eq!(kept_with(SPARE_KEPT, SPARE_KEPT, None), SPARE_KEPT);
+        assert_eq!(kept_with(SPARE, SPARE_KEPT, None), SPARE, "a pool's own limit still holds");
+        assert_eq!(kept_with(SPARE_KEPT, SPARE_KEPT, Some(2)), 2);
+        assert_eq!(kept_with(SPARE, SPARE_KEPT, Some(2)), SPARE, "it never raises what the room picked");
+        assert_eq!(kept_with(SPARE_KEPT, SPARE_KEPT, Some(0)), 0, "none at all is a cap too");
+        assert_eq!(kept_with(SPARE_KEPT, 4, Some(50)), 4, "a pool's own limit is the lower one");
+        // Never more than the switch says, whatever the room picked.
+        for by_room in [0, SPARE, 7, SPARE_KEPT, 100] {
+            for cap in [0, 1, 2, 8, SPARE_KEPT] {
+                let kept = kept_with(by_room, SPARE_KEPT, Some(cap));
+                assert!(kept <= cap, "{kept} kept, the cap is {cap}");
+                assert!(kept <= by_room, "{kept} kept, the room allowed {by_room}");
             }
         }
         // A number of blocks, or nothing at all: a value that is not one is
@@ -644,20 +669,41 @@ mod tests {
     /// two empty blocks does not make eight ahead for them to be let go.
     #[test]
     fn blocks_made_ahead_follow_the_cap() {
-        let most = kept(usize::MAX);
-        assert_eq!(kept(SPARE_KEPT), most, "a pool's own limit is not a lower one");
-        assert!(most <= SPARE_KEPT);
-        if let Some(cap) = spare_most() {
-            assert!(Ripe::now().ahead <= cap, "{} made ahead, the cap is {cap}", Ripe::now().ahead);
+        // What a pool that keeps its own number would make ahead: no global
+        // state, so nothing another test does can change the answer.
+        let with_cap = |cap: usize| Ripe { started: 0, finished: 0, ahead: ahead().min(cap) };
+        assert!(with_cap(2).ahead <= 2, "{} made ahead under a cap of 2", with_cap(2).ahead);
+        assert!(with_cap(0).ahead == 0);
+        assert!(with_cap(usize::MAX).ahead <= ahead());
+        // A pool's own limit is never raised by the switch arithmetic.
+        assert_eq!(kept_with(SPARE_KEPT, SPARE_KEPT, None), SPARE_KEPT);
+        // And the pool itself honours the number it was given.
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT).keeping(2);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let mut taken = Vec::new();
+        for _ in 0..40u64 {
+            taken.push(pool.take(BLOCK / 4, 65536, 0, make).unwrap().0);
         }
-        assert!(Ripe::now().ahead <= most);
+        for p in taken {
+            pool.give(p, 20);
+        }
+        pool.rested(20 + REST);
+        assert!(pool.empty() <= 2, "{} empty kept under a cap of 2", pool.empty());
     }
 
     /// The cap the switch sets is what the pool then keeps: with it at two,
     /// a pool told the card has room still lets empty blocks go past two.
+    ///
+    /// The cap is the pool's own ([`Pool::keeping`]): what the card's room
+    /// says is a global of the process, and a test that read it would pass
+    /// or fail by whichever test ran before it.
     #[test]
     fn a_capped_pool_lets_empty_blocks_go() {
-        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT).keeping(2);
         let made = std::cell::Cell::new(0);
         let make = || {
             made.set(made.get() + 1);
@@ -676,11 +722,14 @@ mod tests {
         }
         // The most that may stay is what `kept` says, whatever the room says.
         pool.rested(20 + REST);
-        let most = kept(SPARE_KEPT);
-        assert!(pool.blocks() <= blocks.min(most).max(1), "{} blocks kept of {blocks}, most {most}", pool.blocks());
+        let most = 2;
+        assert!(pool.blocks() <= blocks, "{} blocks kept of {blocks}", pool.blocks());
         assert!(pool.empty() <= most, "{} empty kept, most {most}", pool.empty());
         assert!(pool.let_go > 0, "empty blocks were let go, not just counted");
         assert_eq!(pool.made_blocks, blocks as u64);
+        // What it let go of is the rest: the blocks it needed, less the two
+        // it keeps.
+        assert_eq!(pool.let_go, blocks as u64 - pool.blocks() as u64);
     }
 
     /// One block asked for past the cap is made again; the count says so.
