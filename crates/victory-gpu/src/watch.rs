@@ -916,8 +916,9 @@ pub(crate) fn port_guard() -> bool {
 /// With renderer port #6: whether a submission's look at which refreshes
 /// copy nothing (`Shadow::nothing_new`, before the threads are woken for the
 /// others) is made on the threads beside the submitting one, as it already
-/// was for more than 256 refreshes (`VICTORY_PORT_GUARD_PLAN=0`: on the
-/// submitting thread, as before; A/B-able by that name).
+/// was for more than 256 refreshes (`VICTORY_PORT_GUARD_PLAN=1`: on the
+/// threads beside; unset here: on the submitting thread, as before. The
+/// author had it on by default; this branch keeps it off until asked for).
 ///
 /// A look walks the journal's every page ever written in the range; one
 /// submission a frame spent up to 6 ms in it alone, the six threads beside it
@@ -931,8 +932,10 @@ pub(crate) fn port_guard_plan() -> bool {
         return on;
     }
     // Read here: renderer port #6's planning beside the submitting thread.
+    // (Off by default here: the author had it on, and this branch keeps every
+    // new behaviour of port #6 off until `VICTORY_PORT_GUARD_PLAN=1`.)
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_GUARD_PLAN").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_GUARD_PLAN").is_ok_and(|v| v.trim() == "1"))
 }
 
 #[cfg(test)]
@@ -5007,5 +5010,212 @@ mod many_askers_tests {
         BITS.clear(511);
         assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+}
+
+/// Renderer port #6's claims (`BUSY`): what changes a block's state under the
+/// lock shared holds its claim, and no two hold the same block's at once.
+#[cfg(test)]
+mod claim_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Threads taking the blocks of one run wait for one another: no two
+    /// hold the same block's claim, each block is taken as many times as
+    /// there were threads, and every claim is let go again.
+    #[test]
+    fn claims_of_one_block_are_held_by_one_thread_at_a_time() {
+        const THREADS: usize = 8;
+        const BLOCKS: usize = 4;
+        const TAKINGS: usize = 200;
+        // The blocks are of this test's own, high in the address space.
+        let base = 1usize << 24;
+        let holding = AtomicUsize::new(0);
+        let most = AtomicUsize::new(0);
+        let takings = [const { AtomicUsize::new(0) }; BLOCKS];
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                let (holding, most, takings) = (&holding, &most, &takings);
+                s.spawn(move || {
+                    for _ in 0..TAKINGS {
+                        let blocks: Vec<usize> = (base..base + BLOCKS).collect();
+                        let claims = super::Claims::wait_for(&blocks);
+                        assert!(claims.holds(base) && claims.holds(base + BLOCKS - 1));
+                        for _ in 0..BLOCKS {
+                            takings.iter().for_each(|n| {
+                                n.fetch_add(1, Ordering::Relaxed);
+                            });
+                        }
+                        let now = holding.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        // (Only one thread is in here at a time: the claim is
+                        // held across it.)
+                        std::thread::yield_now();
+                        holding.fetch_sub(1, Ordering::SeqCst);
+                        drop(claims);
+                    }
+                });
+            }
+        });
+        assert_eq!(most.load(Ordering::SeqCst), 1, "two threads held one block's claim at once");
+        // Every claim was let go: the blocks can be had again at once.
+        let blocks: Vec<usize> = (base..base + BLOCKS).collect();
+        let claims = super::Claims::wait_for(&blocks);
+        assert!(blocks.iter().all(|&b| claims.holds(b)));
+        // Taken again and again, each block once per taking, no more.
+        assert_eq!(takings[0].load(Ordering::Relaxed), THREADS * TAKINGS * BLOCKS);
+        drop(claims);
+    }
+
+    /// Claims are waited for in block order, so two threads taking overlapping
+    /// runs the same way cannot wait for each other: they both get through.
+    #[test]
+    fn claims_in_order_do_not_wait_for_each_other() {
+        let base = 1usize << 25;
+        let one: Vec<usize> = (base..base + 64).collect();
+        let other: Vec<usize> = (base + 32..base + 96).collect();
+        std::thread::scope(|s| {
+            for blocks in [&one, &other, &one, &other] {
+                s.spawn(move || {
+                    for _ in 0..500 {
+                        let claims = super::Claims::wait_for(blocks);
+                        assert!(claims.holds(blocks[0]) && claims.holds(blocks[blocks.len() - 1]));
+                        drop(claims);
+                    }
+                });
+            }
+        });
+        // And a run taken from the top downwards is not what a fault does;
+        // the claims of it are still let go when dropped.
+        let claims = super::Claims::wait_for(&one);
+        drop(claims);
+        assert!(!super::BUSY.any(base, base + 1));
+        assert!(!super::BUSY.any(base + 32, base + 96));
+    }
+
+    /// `try_one` takes a block once: the second try of a block already held
+    /// says so rather than taking it twice, and lets it go once.
+    #[test]
+    fn a_claim_taken_twice_is_taken_once() {
+        let block = 1usize << 26;
+        let mut claims = super::Claims::none();
+        assert!(claims.try_one(block));
+        assert!(!claims.try_one(block), "the same claim taken twice");
+        assert!(claims.holds(block));
+        assert!(super::BUSY.any(block, block + 1));
+        drop(claims);
+        assert!(!super::BUSY.any(block, block + 1), "not let go");
+        let mut again = super::Claims::none();
+        assert!(again.try_one(block), "not to be had again");
+        drop(again);
+        assert!(!super::BUSY.any(block, block + 1));
+    }
+
+    /// The sets the lock shared is read and written through are of atomic
+    /// words: threads inserting and removing their own blocks of one word
+    /// beside one another lose nothing of one another's.
+    #[test]
+    fn blocks_of_one_word_taken_beside_one_another() {
+        const THREADS: usize = 8;
+        // (One word of 64 blocks: 8 threads of 8 blocks each.)
+        const EACH: usize = 8;
+        let base = 1usize << 27;
+        assert_eq!(base / 64, (base + THREADS * EACH - 1) / 64, "the blocks must share a word");
+        static SET: super::Blocks = super::Blocks::new();
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                s.spawn(move || {
+                    for i in 0..EACH {
+                        let block = base + t * EACH + i;
+                        assert!(SET.insert(block), "already there");
+                        assert!(SET.contains(block));
+                    }
+                });
+            }
+        });
+        assert_eq!(SET.len(), THREADS * EACH);
+        // (Beside one another: half remove what the other half inserts.)
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                s.spawn(move || {
+                    for i in 0..EACH {
+                        let block = base + t * EACH + i;
+                        if t % 2 == 0 {
+                            assert!(SET.remove(block), "not there");
+                            assert!(!SET.contains(block));
+                        } else {
+                            assert!(SET.contains(block), "lost beside a removal");
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(SET.len(), THREADS / 2 * EACH);
+    }
+
+    /// Reading a range of the set while another thread inserts and removes
+    /// its own blocks of the same words: the reader sees only blocks that
+    /// were inserted (never one that never was).
+    #[test]
+    fn ranges_read_beside_insertions() {
+        static SET: super::Blocks = super::Blocks::new();
+        let base = 1usize << 28;
+        let going = &std::sync::atomic::AtomicBool::new(true);
+        std::thread::scope(|s| {
+            for t in 0..4 {
+                s.spawn(move || {
+                    for i in 0..2000 {
+                        let block = base + t * 4096 + i;
+                        SET.insert(block);
+                        SET.remove(block);
+                    }
+                });
+            }
+            s.spawn(move || {
+                while going.load(Ordering::Relaxed) {
+                    for block in SET.range(base..base + 4 * 4096) {
+                        assert!((base..base + 4 * 4096).contains(&block), "a block out of the range");
+                    }
+                    for block in SET.range(base + 4096..) {
+                        assert!(block >= base + 4096, "a block below the range");
+                    }
+                }
+            });
+            // (The writers finish first; the reader is told to stop, and the
+            // scope waits for it to.)
+            std::thread::yield_now();
+            let mut done = 0usize;
+            while done < 4 {
+                done = 0;
+                for t in 0..4 {
+                    if !SET.range(base + t * 4096..base + t * 4096 + 2000).next().is_some() {
+                        done += 1;
+                    }
+                }
+            }
+            going.store(false, Ordering::Relaxed);
+        });
+    }
+}
+
+/// The switches of renderer port #6 are off unless asked for: with neither
+/// `VICTORY_PORT_GUARD` nor `VICTORY_PORT_GUARD_PLAN` set, the paths are the
+/// ones they were before the port.
+#[cfg(test)]
+mod port_switch_tests {
+    /// `port_guard` is off unless `VICTORY_PORT_GUARD=1`, and `port_guard_plan`
+    /// with it (it is port #6's, and asks port #6's switch first).
+    #[test]
+    fn the_switches_are_off_unless_asked_for() {
+        // (The test run sets neither; a run with either set tests the same
+        // of the other. Both are read once for the process.)
+        let guard = std::env::var("VICTORY_PORT_GUARD").is_ok_and(|v| v.trim() == "1");
+        let plan = std::env::var("VICTORY_PORT_GUARD_PLAN").is_ok_and(|v| v.trim() == "1");
+        assert_eq!(super::port_guard(), guard, "VICTORY_PORT_GUARD");
+        assert_eq!(super::port_guard_plan(), guard && plan, "VICTORY_PORT_GUARD_PLAN");
+        if !guard {
+            // (Nothing of port #6's is asked for: the guards' lock alone, the
+            // cleanup as before.)
+            assert!(!super::known_views(0, 4), "view memory asked of the kernel with the port off");
+        }
     }
 }
