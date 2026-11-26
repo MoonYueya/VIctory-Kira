@@ -735,3 +735,52 @@ What a next attempt would have to change first: make the policy a ceiling
 uses for card textures (`BUDGET_HIGH` 0.90, `BUDGET_LOW` 0.85); until then a number cannot
 be tuned into doing what its name says. Full numbers, run ids and grades:
 `VIctory-Kira-reports/VK-WINBUDGET-1-2026-11-26.md` (outside this repository).
+
+## Where a world frame's processor time goes (RTX 3080, 2026-11-27)
+
+A frame of 332 ms in the world spends **1,655 ms of processor time** — 4.78 cores
+working at once. Splitting that by thread and by the phase of the frame
+(`VICTORY_CPUPROF`, `crates/victory-loader/src/cpuprof.rs`, read-only, off by default)
+says where:
+
+| who | ms of processor time a frame |
+|---|---|
+| the title's own main thread | 536.6 (17.2 %) |
+| `victory-list-*`, 8 threads (`VICTORY_THIN=1`) | 248.0 |
+| `victory-wide-*`, 4 threads | 164.0 |
+| `victory-submit` (`VICTORY_ASYNC_SUBMIT`) | 56.5 |
+| `victory-relay` | 31.8 |
+| everything else, and threads that came and went | the rest |
+
+**The largest single consumer is the title itself.** One unnamed thread spends
+60 % of its samples running, not waiting, and **48.6 % of them at one address**
+(`+0x4fb0c03` in the title's image) with `SleepEx` beneath it: a busy-wait loop
+of the title's own. 62.3 % of its samples fall after a submission — the stretch
+where the card has our work and the title could be preparing the next frame.
+The title's image carries no symbols, so an address is all there is to say.
+
+The frame's own account, median of 81 world frame lines: 47.6 ms from the
+present to the first list call, 50.2 preparing, 59.8 standing for the card,
+41.5 copying back, 110.4 from the last submission to the next present, leaving
+2.1 ms unaccounted (**190.7 ms at P90** — the tail is not covered by any counter).
+
+The card is idle 158.2 ms of the frame and only 18.8 ms of that is while our own
+thread works: **the wall is the arrangement of the work, not the shaders.**
+
+Two runs of the same world differed by half (681 against 332 ms) and the cause
+was the pipeline library, not the code: the cold run compiled 773 host pipelines
+inside its world section, the warm one 44. A sampling profiler that suspends
+threads was suspected of the cost first and cleared — the window comparisons in
+the two runs point opposite ways.
+
+Of the outside forks, this branch already carries the submit thread
+(fxceless/victory-fork `f85101b6`), joined submission parts (`39731795`), our
+threads on the fast cores (`0b0074e0`), concurrent texture checks
+(Fayberr/Victory-United `22d34cca`) and the slow-pipeline side road
+(`a30829c4`). It does **not** carry `VICTORY_INDIRECT_GATHER` (`465b94f5`),
+the per-frame log `framelog.rs` or the card meter `cardmeter.rs` (both
+`a2537066`), or `VICTORY_MAP_RUNS` (TaynanGT/Vice-Tay, edsuu/VI-BR-PORT
+`4180818`). None of the four clones shares this branch's base commit, so that
+comparison is by what the code does, not by the commit graph.
+Full numbers, run ids and grades: `VIctory-Kira-reports/VK-CPUPROF-1-2026-11-27.md`
+(outside this repository).
