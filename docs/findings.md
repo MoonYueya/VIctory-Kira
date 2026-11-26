@@ -539,3 +539,44 @@ first.
 Fixed by this work: the ledger itself. Not settled: whether lowering the empty-block reserve
 gives the textures the room back without making the pool re-create blocks, and what the
 buffer copies cost in frame time when they are not on the card.
+
+### Dropping a title texture's host copy once its upload has run (`VICTORY_DROP_HOST_COPY`, off by default)
+
+A title texture keeps a host copy in the card's memory and a staging buffer in the
+process's, and `resource::let_go_idle` lets both go only once nothing has used the
+texture for seconds and the card is nearly full. This work asked whether letting them
+go as soon as the upload that filled them has run would lower the process's private
+memory. It does not, and the switch stays off by default.
+
+`VICTORY_DROP_HOST_COPY=1` reuses that same path with an idle time of none: the guards
+are unchanged (`fills`, no host copy into it, no list, no slot, one reference), the next
+use makes the copy and its staging buffer anew and uploads the title's memory again.
+Two runs of 480 s on a 10 GB card, same binary and cache (commit `d263bda`, base
+`9102a4c`):
+
+| | A control | B `VICTORY_DROP_HOST_COPY=1` |
+|---|---|---|
+| world frames | 70 | 72 |
+| frame time, median | 489.2 ms | 478.1 ms |
+| private memory, peak | 27,196 MB | 27,219 MB |
+| free physical, lowest | 252 MB | 41 MB |
+| texture host copies, median | 3,043 MB | 2,850 MB |
+| staging pool, median | 320 MB | 512 MB |
+| lack of room | 625 | 522 |
+| passed over unmapped | 20,271 | 5,434 |
+| copies let go / made again | 42,126 / 1,984 | 40,646 / 2,834 |
+| device removals / panics | 0 / 0 | 0 / 0 |
+
+The card's side improves (193 MB fewer host copies, a sixth fewer passes with no room,
+three quarters fewer textures passed over unmapped) and the frame time is unchanged
+within noise. Private memory does not move, and the reason is structural rather than a
+fault in the change: the host copies live in the card's memory (`vram.rs`), and what the
+process holds for them is the staging buffers, which are a few hundred MB, not the
+2.8 GB the copies add up to. The process's private memory is held by list growth
+(8.5 GB) and the copies of title windows (4.5 GB), neither of which this touches.
+Releasing the copies early also makes the staging pool grow (320 to 512 MB), since each
+rebuilt copy asks for a staging buffer again: 2,834 rebuilds re-read 2,265 MB of title
+memory.
+
+Conclusion: worth keeping as an opt-in for the card's side, not as a way to lower
+private memory, and not as a default.
